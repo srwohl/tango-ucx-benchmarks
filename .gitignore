@@ -1,0 +1,19 @@
+# Build trees, and the tango-ucx package installed by pixi run stage.
+/build/
+/build-*/
+/stage/
+/compile_commands.json
+
+# pixi environments; pixi.lock is tracked.
+/.pixi/
+
+# Results of a sweep.
+/results/
+
+# Python.
+__pycache__/
+*.py[cod]
+
+# Editors.
+/.cache/
+/.vscode/

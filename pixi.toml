@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Copyright contributors to the tango-ucx project
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+[workspace]
+name = "tango-ucx-benchmarks"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+requires-pixi = ">=0.55"
+
+[dependencies]
+cmake = "*"
+ninja = "*"
+clang-format = "*"
+cxx-compiler = "*"
+# What the installed tango-ucx package needs to be found and linked.
+cpptango = ">=10.0"
+cppzmq = "*"
+ucx = ">=1.21"
+nlohmann_json = ">=3.12"
+
+[tasks]
+# The library is built in its own environment, with `pixi run build-profile` there: optimized,
+# with frame pointers. This installs that build here. TANGO_UCX_SOURCE names another checkout.
+stage = "bash -c 'cmake --install ${TANGO_UCX_SOURCE:-../tango-ucx}/build-profile --prefix stage'"
+configure = { cmd = "cmake -GNinja -S . -B build -DCMAKE_PREFIX_PATH=$PWD/stage", depends-on = ["stage"] }
+build = { cmd = "cmake --build build", depends-on = ["configure"] }
+test = { cmd = "ctest --test-dir build --output-on-failure", depends-on = ["build"] }
