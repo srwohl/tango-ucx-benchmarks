@@ -17,11 +17,33 @@ cpptango = ">=10.0"
 cppzmq = "*"
 ucx = ">=1.21"
 nlohmann_json = ">=3.12"
+# The driver.
+python = ">=3.11"
+
+[feature.gpu.dependencies]
+# ucx_perftest's CUDA allocator is a plugin linked to the CUDA runtime. UCX's
+# driver-based transports alone can be present while `-m cuda` still fails.
+cuda-version = "12.9.*"
+cuda-cudart = "*"
+cuda-cudart-dev = "*"
+cuda-nvcc = "*"
+
+[environments]
+default = ["default"]
+gpu = ["default", "gpu"]
+
+[feature.gpu.tasks]
+cuda-ipc = "python cuda_ipc.py"
+stage-gpu = "bash stage_gpu.sh"
+configure-gpu = { cmd = "cmake -GNinja -S . -B build-gpu -DCMAKE_PREFIX_PATH=$PWD/stage-gpu -DBENCHMARKS_CUDA=ON", depends-on = ["stage-gpu"] }
+build-gpu = { cmd = "cmake --build build-gpu", depends-on = ["configure-gpu"] }
+test-gpu = { cmd = "ctest --test-dir build-gpu --output-on-failure", depends-on = ["build-gpu"] }
+cuda-compare = { cmd = "python compare_ucx.py --memory cuda --build build-gpu", depends-on = ["build-gpu"] }
 
 [tasks]
 # The library is built in its own environment, with `pixi run build-profile` there: optimized,
-# with frame pointers. This installs that build here. TANGO_UCX_SOURCE names another checkout.
-stage = "bash -c 'cmake --install ${TANGO_UCX_SOURCE:-../tango-ucx}/build-profile --prefix stage'"
+# with frame pointers. stage.sh brings that build up to date and installs it here.
+stage = "bash stage.sh"
 configure = { cmd = "cmake -GNinja -S . -B build -DCMAKE_PREFIX_PATH=$PWD/stage", depends-on = ["stage"] }
 build = { cmd = "cmake --build build", depends-on = ["configure"] }
 test = { cmd = "ctest --test-dir build --output-on-failure", depends-on = ["build"] }

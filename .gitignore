@@ -2,6 +2,7 @@
 /build/
 /build-*/
 /stage/
+/stage-*/
 /compile_commands.json
 
 # pixi environments; pixi.lock is tracked.
