@@ -65,6 +65,7 @@ Keep UCX and cppTango versions aligned between the library and benchmark environ
 | [bench.py](bench.py) | What bandwidth does tango-ucx sustain at each frame size and ring depth? |
 | [bench.py](bench.py) `--hdf5` | How fast can a detector's image stack be replayed from its HDF5 file? |
 | [hdf5_write.py](hdf5_write.py) | How fast can a stream be written to HDF5 shards by threads, processes and hosts? |
+| [zarr_write.py](zarr_write.py) | The same, written to Zarr v3 by acquire-zarr, with buffered or direct I/O |
 | [frame_cost.py](frame_cost.py) | What is sustained time per frame as size, depth and batch size change? |
 | [cpu_cost.py](cpu_cost.py) | How much CPU and publish-to-read latency does an application rate require? |
 | [compare_ucx.py](compare_ucx.py) | How do reused UCX buffers, rotating raw UCP rings and library delivery compare? |
@@ -193,6 +194,67 @@ the same process, the minimum and maximum one-second rates, and sync time. `--ch
 master back and compares each frame with what was sent. Files of passing runs are deleted
 unless `--keep` is given. Writer logs are kept beside `--out`. The `hdf5_write` test runs
 `--self-test`.
+
+### Writing Zarr with acquire-zarr
+
+`zarr_write.py` runs the same layouts as `hdf5_write.py`, but the writer is
+`tango_ucx_zarr_writer`, built on [acquire-zarr](https://github.com/acquire-project/acquire-zarr).
+It lives in its own pixi environment, because acquire-zarr is not on conda-forge and its
+release libraries need glibc 2.38. `stage_zarr.sh` builds v0.10.0 from source into
+`stage-zarr/`:
+
+```sh
+pixi run -e zarr test-zarr       # stage tango-ucx and acquire-zarr, build build-zarr, self-tests
+pixi run -e zarr python zarr_write.py --output-dir /gpfs/scratch/me --frame-bytes 4M \
+  --frames 4096 --layouts 1x1,1x4,4x1,8x1 --repeats 3 --out results/zarr-buffered.jsonl
+pixi run -e zarr python zarr_write.py --output-dir /gpfs/scratch/me --frame-bytes 4M \
+  --frames 4096 --layouts 1x1,1x4,4x1,8x1 --repeats 3 --direct-io --out results/zarr-direct.jsonl
+```
+
+Each writer thread owns a part, `capture.part_NNN.zarr`: a Zarr v3 store whose `/images` is
+`[frame, ...image]`, sharded along frames. A one-axis frame is stored as `[1, n]`, because
+acquire-zarr needs two image axes. Differences from the HDF5 writer:
+
+- **An append copies and returns.** `ZarrStream_append` copies a block into the stream's queue
+  (about 256 MiB) and returns; acquire-zarr's own threads write it. So the credit returns
+  before the frames are on disk. "GB/s" runs from the first frame received to the last part
+  closed, which is when every shard is written and fsynced; "accepted" runs to the last append.
+- **No lock between threads.** Each stream is independent, so `1xT` is not serialized the way
+  HDF5 is. Each stream starts its own pool, by default one thread per core: set
+  `--zarr-threads` when T is large.
+- **No `--no-sync`.** acquire-zarr fsyncs each shard file, and `ZarrStream_close` reports a
+  failed write or flush.
+- **Compression** is `--compression none|blosc-lz4|blosc-zstd|zstd` with `--level` and
+  `--shuffle`.
+
+After each run the driver makes `capture.zarr`, a native Zarr v3 store of the whole stream that
+zarr-python, tensorstore or any other Zarr v3 reader opens:
+
+```python
+import zarr
+images = zarr.open_array("/gpfs/scratch/me/tango-ucx-zarr-.../capture.zarr/images", mode="r")
+```
+
+Its `images/zarr.json` is the parts' array with the run's frame count. Each shard file is a
+relative symlink to a part's shard file, so nothing is copied. This works because the publisher
+gives each puller whole ranges that start at multiples of the range, and the writer refuses to
+start unless a shard (`--chunk-frames` x `--shard-chunks`, by default the range) divides the
+range. Each part records its frames' runs in `images/zarr.json` under
+`attributes.tango_ucx.frame_runs`. A frame missing or written twice fails the run, and so does a
+range split between pullers, which happens only if a puller leaves mid-run. `--check` reads
+every frame back with zarr-python and with tensorstore and compares it with what was sent. To
+copy a capture elsewhere, follow the links (`cp -rL`, `rsync -L`). Moving the run directory
+as a whole keeps them working.
+
+`--direct-io` sets `ZARR_DIRECT_IO=1`, which opens shard files with `O_DIRECT`. acquire-zarr
+writes one `pwrite` per chunk, then a small index at the end of each shard file, so only the
+filesystem decides whether unaligned direct writes work. NFS takes them; ext4 and XFS fail
+every write with `EINVAL`. On GPFS, a direct write that allocates a new block, or is not
+aligned, leaves the fast direct path and is synced before it returns. Streaming writes allocate
+on nearly every block, so measure direct I/O against buffered writes, not instead of them. Use
+uncompressed chunks of at least the GPFS block size (`mmlsfs <fs> -B`); compressed chunks have
+odd lengths, so every write after a shard's first is unaligned. The self-test runs a direct
+I/O case only when the build directory is on NFS or GPFS.
 
 ### Sustained time per frame
 

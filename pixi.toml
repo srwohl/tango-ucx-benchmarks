@@ -30,9 +30,32 @@ cuda-cudart = "*"
 cuda-cudart-dev = "*"
 cuda-nvcc = "*"
 
+[feature.zarr.dependencies]
+# acquire-zarr is not packaged: stage_zarr.sh builds it from source against these. Its S3 client,
+# minio-cpp, is linked in whether or not S3 is used, hence curl, OpenSSL and pugixml.
+blosc = ">=1.21.5"
+libcrc32c = ">=1.1.2"
+zstd = ">=1.5.5"
+yaml-cpp = ">=0.8.0"
+openssl = "*"
+pugixml = "*"
+curlpp = "*"
+libcurl = "*"
+zlib = "*"
+# The driver reads the stitched capture back with the reference reader, and with tensorstore.
+zarr = ">=3.1"
+tensorstore = "*"
+
+[feature.zarr.tasks]
+stage-zarr = "bash stage_zarr.sh"
+configure-zarr = { cmd = "cmake -GNinja -S . -B build-zarr \"-DCMAKE_PREFIX_PATH=$PWD/stage;$PWD/stage-zarr;$CONDA_PREFIX\" -DBENCHMARKS_ZARR=ON", depends-on = ["stage", "stage-zarr"] }
+build-zarr = { cmd = "cmake --build build-zarr", depends-on = ["configure-zarr"] }
+test-zarr = { cmd = "ctest --test-dir build-zarr -R 'write' --output-on-failure", depends-on = ["build-zarr"] }
+
 [environments]
 default = ["default"]
 gpu = ["default", "gpu"]
+zarr = ["default", "zarr"]
 
 [feature.gpu.tasks]
 cuda-ipc = "python cuda_ipc.py"

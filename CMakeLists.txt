@@ -16,6 +16,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-fno-omit-frame-pointer)
 option(BENCHMARKS_CUDA "Build CUDA source and receive benchmark rings" OFF)
 option(BENCHMARKS_HDF5 "Let the publisher read its frames from an HDF5 image stack" ON)
+option(BENCHMARKS_ZARR "Build the acquire-zarr writer (pixi run -e zarr build-zarr)" OFF)
 
 find_package(tango-ucx CONFIG REQUIRED)
 find_package(nlohmann_json 3.12 CONFIG REQUIRED)
@@ -39,6 +40,18 @@ if(BENCHMARKS_HDF5)
     add_executable(tango_ucx_hdf5_writer src/hdf5_writer.cpp)
     target_link_libraries(tango_ucx_hdf5_writer PRIVATE
         tango-ucx::ucx nlohmann_json::nlohmann_json HDF5::HDF5)
+endif()
+if(BENCHMARKS_ZARR)
+    # stage_zarr.sh's acquire-zarr, a static library: its package names, but does not find,
+    # zstd and yaml-cpp.
+    find_package(zstd CONFIG REQUIRED)
+    find_package(yaml-cpp CONFIG REQUIRED)
+    find_package(acquire-zarr CONFIG REQUIRED)
+    add_executable(tango_ucx_zarr_writer src/zarr_writer.cpp)
+    target_link_libraries(tango_ucx_zarr_writer PRIVATE
+        tango-ucx::ucx nlohmann_json::nlohmann_json acquire-zarr::acquire-zarr)
+    target_compile_definitions(tango_ucx_zarr_writer PRIVATE
+        ACQUIRE_ZARR_RELEASE="${acquire-zarr_VERSION}")
 endif()
 add_executable(tango_ucx_perftest src/perftest.cpp)
 target_link_libraries(tango_ucx_perftest PRIVATE tango-ucx::ucx nlohmann_json::nlohmann_json)
@@ -126,6 +139,13 @@ if(BUILD_TESTING)
         add_test(NAME hdf5_write COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/hdf5_write.py --build ${CMAKE_CURRENT_BINARY_DIR} --self-test)
         set_tests_properties(hdf5_write PROPERTIES TIMEOUT 600 FAIL_REGULAR_EXPRESSION "FAILED")
+    endif()
+    if(BENCHMARKS_ZARR AND BENCHMARKS_HDF5)
+        # The same layouts and sources written by acquire-zarr: each run's parts stitched into one
+        # Zarr store, which zarr-python and tensorstore read back frame for frame.
+        add_test(NAME zarr_write COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/zarr_write.py --build ${CMAKE_CURRENT_BINARY_DIR} --self-test)
+        set_tests_properties(zarr_write PROPERTIES TIMEOUT 900 FAIL_REGULAR_EXPRESSION "FAILED")
     endif()
     set_tests_properties(bw_reference PROPERTIES
         PASS_REGULAR_EXPRESSION "ucx_perftest -e .*\n.* tango-ucx .*%")

@@ -8,7 +8,7 @@
     report.py a.jsonl b.jsonl --label before,after --out compared.md
 
 A sweep made with bench.py --hdf5 also has its file's frames against generated ones. A file of
-hdf5_write.py has its writes: processes x threads, on one host or several.
+hdf5_write.py or zarr_write.py has its writes: processes x threads, on one host or several.
 
 The first file is what the others are compared with.
 """
@@ -41,10 +41,14 @@ def load(path):
         for line in lines:
             record = json.loads(line)
             if "meta" in record:
-                meta = {**record["meta"], **{k: meta[k] for k in ("writes",) if k in meta}}
+                meta = {**record["meta"], **{k: meta[k] for k in ("writes", "zarr_writes")
+                                             if k in meta}}
                 continue
             if record.get("test") == "hdf5_write":
                 meta.setdefault("writes", []).append(record)
+                continue
+            if record.get("test") == "zarr_write":
+                meta.setdefault("zarr_writes", []).append(record)
                 continue
             depth = record.get("depth_asked")
             if depth is None and isinstance(record.get("depth"), dict):
@@ -312,6 +316,65 @@ def write_section(label, meta):
     return lines + table(header, rows, words=2)
 
 
+def zarr_write_section(label, meta):
+    """zarr_write.py's runs, a row for each layout and setting: GB/s to the parts closed and
+    durable, the rate appends were accepted at, and the memory acquire-zarr held."""
+    runs = meta.get("zarr_writes")
+    if not runs:
+        return []
+    groups = {}
+    for run in runs:
+        zarr = run.get("zarr") or {}
+        key = (len(run["hosts"]), run["processes_per_host"], run["threads"],
+               run["frames_per_block"], run["blocks_per_stripe"],
+               f"{zarr.get('chunk_frames', '?')}x{zarr.get('shard_chunks', '?')}",
+               run["compression"], "direct" if run["direct_io"] else "buffered")
+        groups.setdefault(key, []).append(run)
+    first = runs[0]
+    source = first.get("source") or {}
+    what = (f"`{source['file']}` ({source['element']} {' x '.join(map(str, source['shape']))})"
+            if source.get("kind") == "hdf5" else "generated frames")
+    zarr = first.get("zarr") or {}
+    notes = ", ".join(f"{k} {v}" for k, v in (meta.get("notes") or {}).items())
+    lines = [f"## Zarr writes: {label}", "",
+             f"{first['frames']} frames of {frame(first.get('frame_bytes') or 0)} from {what}, "
+             f"written to `{meta.get('output_dir', '?')}` ({meta.get('filesystem', '?')})"
+             + (f"; {notes}" if notes else "") + f". acquire-zarr {zarr.get('release', '?')}, "
+             f"{zarr.get('max_threads') or 'its default'} threads a stream.", "",
+             "A layout is processes x threads on each host; every thread writes its own part. "
+             "Shard is chunk frames x chunks a shard. GB/s is all the bytes over the time from the "
+             "first frame received to the last part closed, every shard fsynced: the median of "
+             "the runs with best and worst. \"Accepted\" ends at the last append, which copies "
+             "into acquire-zarr's queue. \"Appends\" is the writers' time in appends over that "
+             "time. MiB is the memory the streams held at their peak, of the median run.", ""]
+    header = ["Hosts", "Layout", "Writers", "Block", "Stripe", "Shard", "Compression", "I/O",
+              "GB/s", "best", "worst", "accepted", "per writer", "appends", "close s", "MiB",
+              "runs"]
+    rows = []
+    for (hosts, processes, threads, block, stripe, shard, compression, io), group in groups.items():
+        start = [hosts, f"{processes}x{threads}", group[0]["writers"], block, stripe, shard,
+                 compression, io]
+        good = [run for run in group if run.get("ok")]
+        if not good:
+            rows.append(start + [""] * 8 + [f"0 of {len(group)}: {group[0].get('failure', '')}"])
+            continue
+        rates = sorted(run["GB_per_second"] for run in good)
+        median = statistics.median(rates)
+        middle = min(good, key=lambda run: abs(run["GB_per_second"] - median))
+        each = middle["per_writer_MiB_per_second"]
+
+        def gb(value):
+            return "" if value is None else f"{value:.2f}"
+        rows.append(start + [gb(median), gb(rates[-1]), gb(rates[0]),
+                             gb(middle["accepted_GB_per_second"]),
+                             gb(statistics.mean(each) * (1 << 20) / 1e9) if each else "",
+                             f"{middle['append_concurrency']:.2f}",
+                             f"{middle['close_seconds_max']:.2f}",
+                             f"{middle['memory_peak_bytes'] / (1 << 20):.0f}",
+                             f"{len(good)} of {len(group)}"])
+    return lines + table(header, rows, words=2)
+
+
 def path_section(label, points):
     sizes = sorted({size for _, size, _ in points})
     rows = []
@@ -345,6 +408,7 @@ def main():
         lines += compared_section(labels, sweeps)
     for label, (meta, _) in zip(labels, sweeps):
         lines += write_section(label, meta)
+        lines += zarr_write_section(label, meta)
     for label, (_, points) in zip(labels, sweeps):
         if points:
             lines += share_section(label, points)
