@@ -1,13 +1,14 @@
 # tango-ucx-benchmarks
 
 Measure [tango-ucx](https://github.com/srwohl/tango-ucx) bandwidth, CPU cost and delivery
-latency against UCX references. The benchmark programs link the installed library through
+latency against UCX references, and how fast its frames can be replayed from and written to HDF5. The benchmark programs link the installed library through
 its public C++ API, so they exercise the same publishing and subscription path as an application.
 
 Use the tools to compare library builds, size transport rings, choose batch sizes and idle
-modes, and distinguish transport costs from application delivery. Automated comparisons run
-locally with host memory or CUDA IPC. The Tango publisher and subscriber can also be launched
-manually on separate hosts; automated two-host and tango-bulk comparisons are not provided.
+modes, and distinguish transport costs from application delivery. Transport comparisons run
+locally with host memory or CUDA IPC; the Tango publisher and subscriber can also be launched
+manually on separate hosts. HDF5 writes run on this host or on several, reached by ssh.
+Automated tango-bulk comparisons are not provided.
 
 ## Run a bandwidth sweep
 
@@ -63,6 +64,7 @@ Keep UCX and cppTango versions aligned between the library and benchmark environ
 |---|---|
 | [bench.py](bench.py) | What bandwidth does tango-ucx sustain at each frame size and ring depth? |
 | [bench.py](bench.py) `--hdf5` | How fast can a detector's image stack be replayed from its HDF5 file? |
+| [hdf5_write.py](hdf5_write.py) | How fast can a stream be written to HDF5 shards by threads, processes and hosts? |
 | [frame_cost.py](frame_cost.py) | What is sustained time per frame as size, depth and batch size change? |
 | [cpu_cost.py](cpu_cost.py) | How much CPU and publish-to-read latency does an application rate require? |
 | [compare_ucx.py](compare_ucx.py) | How do reused UCX buffers, rotating raw UCP rings and library delivery compare? |
@@ -148,6 +150,49 @@ build/tango_ucx_perftest 'publisher-node:22080/bench/ucx/1#dbase=no' --hdf5 /dat
 `hdf5_sample.py` writes stacks of a chosen shape, type, layout and compression. Its
 `--self-test` is the `hdf5_replay` check run by `pixi run test`. Configure with
 `-DBENCHMARKS_HDF5=OFF` to build without HDF5. CUDA source slots are not supported for files.
+
+### Writing HDF5 shards
+
+`hdf5_write.py` writes a stream to HDF5 with writers laid out as processes x threads.
+Each thread of `tango_ucx_hdf5_writer` joins the publisher's pull set and writes its own shard,
+`capture.part_NNN.h5`. A range of `--frames-per-block` x `--blocks-per-stripe` frames goes to
+one writer at a time. A writer writes each block with one `H5Dwrite`, directly from its receive
+ring, and then releases it; the publisher's credit returns only after the write. After each
+run the driver creates `capture.h5`, whose virtual `/images` dataset restores stream order
+from each shard's `/frame_index`. Every frame must appear exactly once.
+
+```sh
+pixi run python hdf5_write.py --output-dir /gpfs/scratch/me --frame-bytes 4M --frames 4096 \
+  --layouts 1x1,1x4,4x1,8x1 --repeats 3 --note gpfs_block_size=8MiB --out results/writes.jsonl
+pixi run python report.py results/writes.jsonl
+```
+
+The layouts separate HDF5's limits:
+
+| Layout | What it shows |
+|---|---|
+| `1x1` | The most one writer process achieves |
+| `1xT` | Threads in one process: the thread-safe library runs one call at a time, so "waiting" grows and "overlap" stays near 1 |
+| `Px1` | Processes on one host: separate libraries, so HDF5 calls overlap |
+| `--hosts n1,n2 --layouts Px1` | P processes on each host |
+
+For other hosts, the driver starts writers by ssh from this checkout's path, or from
+`--remote-build`; `deploy.sh` creates matching paths. `--publisher-address` is this host's
+name as the writer hosts reach it. The output directory must be shared, because the driver
+creates the master and removes the files. The publisher runs here and replays `--hdf5` files
+or generated frames of `--frame-bytes`. A publisher has at most 64 sessions, so a run has at
+most 60 writers.
+
+Shards are chunked, with one block per chunk unless `--chunk-frames` is given. They grow as
+frames arrive, because the frames each writer receives are not known in advance. Each writer
+calls `fsync` after closing its shard; `--no-sync` omits that, and so durability, from the
+measurement. Throughput runs from the first frame received to the last write. The report
+lists each layout's median, best and worst GB/s. It also gives the per-writer rate, overlap
+(time in HDF5 calls over run time), the share of HDF5 time spent waiting for another thread in
+the same process, the minimum and maximum one-second rates, and sync time. `--check` reads the
+master back and compares each frame with what was sent. Files of passing runs are deleted
+unless `--keep` is given. Writer logs are kept beside `--out`. The `hdf5_write` test runs
+`--self-test`.
 
 ### Sustained time per frame
 
@@ -334,7 +379,7 @@ cd "$DEPLOY_ROOT/tango-ucx-benchmarks"
 ./sweep.sh quick
 ```
 
-Deployment supports running local comparisons on each host; it does not create an
-automated benchmark between hosts.
+Deployment supports running local comparisons on each host. `hdf5_write.py --hosts` is the
+only automated benchmark that spans hosts.
 
 LGPL-3.0-or-later; see [LICENSE](LICENSE).

@@ -36,6 +36,9 @@ if(BENCHMARKS_HDF5)
     find_package(HDF5 REQUIRED COMPONENTS C)
     target_compile_definitions(tango_ucx_perf_publisher PRIVATE BENCHMARKS_HDF5)
     target_link_libraries(tango_ucx_perf_publisher PRIVATE HDF5::HDF5)
+    add_executable(tango_ucx_hdf5_writer src/hdf5_writer.cpp)
+    target_link_libraries(tango_ucx_hdf5_writer PRIVATE
+        tango-ucx::ucx nlohmann_json::nlohmann_json HDF5::HDF5)
 endif()
 add_executable(tango_ucx_perftest src/perftest.cpp)
 target_link_libraries(tango_ucx_perftest PRIVATE tango-ucx::ucx nlohmann_json::nlohmann_json)
@@ -118,6 +121,11 @@ if(BUILD_TESTING)
             --build ${CMAKE_CURRENT_BINARY_DIR} --self-test)
         add_test(NAME hdf5_replay COMMAND ${hdf5})
         set_tests_properties(hdf5_replay PROPERTIES TIMEOUT 180)
+        # Writers as threads, as processes and both, from generated frames and a file: each
+        # run's master has every frame once, and each frame is what was sent.
+        add_test(NAME hdf5_write COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/hdf5_write.py --build ${CMAKE_CURRENT_BINARY_DIR} --self-test)
+        set_tests_properties(hdf5_write PROPERTIES TIMEOUT 600 FAIL_REGULAR_EXPRESSION "FAILED")
     endif()
     set_tests_properties(bw_reference PROPERTIES
         PASS_REGULAR_EXPRESSION "ucx_perftest -e .*\n.* tango-ucx .*%")

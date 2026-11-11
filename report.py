@@ -7,7 +7,8 @@
     report.py results/a.jsonl results/b.jsonl      and b against a, point by point
     report.py a.jsonl b.jsonl --label before,after --out compared.md
 
-A sweep made with bench.py --hdf5 also has its file's frames against generated ones.
+A sweep made with bench.py --hdf5 also has its file's frames against generated ones. A file of
+hdf5_write.py has its writes: processes x threads, on one host or several.
 
 The first file is what the others are compared with.
 """
@@ -40,7 +41,10 @@ def load(path):
         for line in lines:
             record = json.loads(line)
             if "meta" in record:
-                meta = record["meta"]
+                meta = {**record["meta"], **{k: meta[k] for k in ("writes",) if k in meta}}
+                continue
+            if record.get("test") == "hdf5_write":
+                meta.setdefault("writes", []).append(record)
                 continue
             depth = record.get("depth_asked")
             if depth is None and isinstance(record.get("depth"), dict):
@@ -252,6 +256,62 @@ def hdf5_section(label, meta, points):
     return lines + table(header, rows)
 
 
+def write_section(label, meta):
+    """hdf5_write.py's runs, a row for each layout: what the writers wrote together, each one's
+    share, and how much of the time HDF5 calls overlapped or waited for the library."""
+    runs = meta.get("writes")
+    if not runs:
+        return []
+    groups = {}
+    for run in runs:
+        key = (len(run["hosts"]), run["processes_per_host"], run["threads"],
+               run["frames_per_block"], run["blocks_per_stripe"], run["queue"])
+        groups.setdefault(key, []).append(run)
+    first = runs[0]
+    source = first.get("source") or {}
+    what = (f"`{source['file']}` ({source['element']} {' x '.join(map(str, source['shape']))})"
+            if source.get("kind") == "hdf5" else "generated frames")
+    hdf5 = first.get("hdf5") or {}
+    notes = ", ".join(f"{k} {v}" for k, v in (meta.get("notes") or {}).items())
+    lines = [f"## HDF5 writes: {label}", "",
+             f"{first['frames']} frames of {frame(first.get('frame_bytes') or 0)} from {what}, "
+             f"written to `{meta.get('output_dir', '?')}` ({meta.get('filesystem', '?')})"
+             + (f"; {notes}" if notes else "") + f". HDF5 {hdf5.get('version', '?')}, "
+             f"{'thread-safe' if hdf5.get('threadsafe') else 'not thread-safe'}; each shard "
+             f"{'is' if first.get('sync') else 'is not'} synchronized to storage after it closes.",
+             "",
+             "A layout is processes x threads on each host; every thread writes its own shard. "
+             "GB/s is all the bytes over the time from the first frame received to the last write, "
+             "the median of the runs with best and worst. \"Overlap\" is the writers' time in "
+             "HDF5 calls over that time: above 1, calls ran at once. \"Waiting\" is the share of "
+             "a writer's HDF5 time spent waiting for another thread of its process to leave the "
+             "library. One-second rates are of the median run.", ""]
+    header = ["Hosts", "Layout", "Writers", "Block", "Stripe", "Queue", "GB/s", "best", "worst",
+              "per writer", "overlap", "waiting", "1 s min", "1 s max", "sync s", "runs"]
+    rows = []
+    for (hosts, processes, threads, block, stripe, depth), group in groups.items():
+        good = [run for run in group if run.get("ok")]
+        if not good:
+            rows.append([hosts, f"{processes}x{threads}", group[0]["writers"], block, stripe,
+                         depth] + [""] * 9 + [f"0 of {len(group)}: {group[0].get('failure', '')}"])
+            continue
+        rates = sorted(run["GB_per_second"] for run in good)
+        median = statistics.median(rates)
+        middle = min(good, key=lambda run: abs(run["GB_per_second"] - median))
+        steady = middle.get("sustained") or {}
+        each = middle["per_writer_MiB_per_second"]
+
+        def gb(value):
+            return "" if value is None else f"{value:.2f}"
+        rows.append([hosts, f"{processes}x{threads}", middle["writers"], block, stripe, depth,
+                     gb(median), gb(rates[-1]), gb(rates[0]),
+                     gb(statistics.mean(each) * (1 << 20) / 1e9) if each else "",
+                     f"{middle['write_concurrency']:.2f}", f"{middle['hdf5_wait_share']:.0%}",
+                     gb(steady.get("GB_per_second_min")), gb(steady.get("GB_per_second_max")),
+                     f"{middle['sync_seconds_max']:.2f}", f"{len(good)} of {len(group)}"])
+    return lines + table(header, rows, words=2)
+
+
 def path_section(label, points):
     sizes = sorted({size for _, size, _ in points})
     rows = []
@@ -283,15 +343,21 @@ def main():
     lines += host_section(labels, sweeps)
     if len(sweeps) > 1:
         lines += compared_section(labels, sweeps)
+    for label, (meta, _) in zip(labels, sweeps):
+        lines += write_section(label, meta)
     for label, (_, points) in zip(labels, sweeps):
-        lines += share_section(label, points)
+        if points:
+            lines += share_section(label, points)
     for label, (meta, points) in zip(labels, sweeps):
         lines += hdf5_section(label, meta, points)
     for label, (_, points) in zip(labels, sweeps):
-        lines += small_frame_section(label, points)
-    lines += trouble_section(labels, sweeps)
+        if points:
+            lines += small_frame_section(label, points)
+    if any(points for _, points in sweeps):
+        lines += trouble_section(labels, sweeps)
     for label, (_, points) in zip(labels, sweeps):
-        lines += path_section(label, points)
+        if points:
+            lines += path_section(label, points)
     text = "\n".join(lines).rstrip() + "\n"
     if args.out:
         Path(args.out).write_text(text)
