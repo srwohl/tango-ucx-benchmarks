@@ -11,6 +11,12 @@ fails the command rather than logging in again.
 
     remote.py check --hosts node1,node2              log in to each and print its name
     remote.py on --hosts node1,node2 -- 'df -h /tmp'  run a shell command on each, in turn
+    remote.py relay --host node1 -- 'COMMAND'        run COMMAND on node1, where it may log in to
+                                                     other hosts with this password, not asked again
+
+A relay gives the one host a private socket, forwarded back here for that connection only and
+removed when the command ends: logins made there ask this process for the password. Its root
+could use the socket while the command runs, as it could see a password typed there.
     remote.py run --hosts node1,node2 -- CMD ARGS    run CMD here with those logins open;
                                                      CMD reaches the hosts with "$REMOTE_SSH"
 """
@@ -20,6 +26,7 @@ import getpass
 import math
 import os
 from pathlib import Path
+import secrets
 import shlex
 import socket
 import socketserver
@@ -27,8 +34,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import warnings
 
 PASSWORD_SOCKET = 'REMOTE_PASSWORD_SOCKET'
+# Set by a relay on the host it runs a command on: the socket there leads to the password.
+RELAYED = 'REMOTE_PASSWORD_RELAYED'
 # sshd's default MaxSessions: the commands one login carries at once.
 SESSIONS_PER_LOGIN = 10
 # A login left behind by a killed run ends after this long unused.
@@ -59,27 +69,47 @@ def private_directory(prefix):
     return tempfile.TemporaryDirectory(prefix=prefix, dir=base if len(base) <= 40 else '/tmp')
 
 
+def write_helper(directory):
+    helper = directory / 'askpass'
+    helper.write_text('#!/bin/sh\nexec ' + shlex.join(
+        [sys.executable, str(Path(__file__).resolve()), '--askpass']) + ' "$@"\n')
+    helper.chmod(0o700)
+    return helper
+
+
 @contextmanager
 def password_environment(enabled, prompt='SSH password (reused for all selected nodes): '):
-    """Serve one in-memory password to SSH_ASKPASS via a private local socket."""
+    """Serve one in-memory password to SSH_ASKPASS via a private local socket. Under a relay,
+    the relay's socket serves it, and nothing is asked."""
     env = dict(os.environ)
     if not enabled:
         yield env
         return
-    password = getpass.getpass(prompt)
+    relayed = os.environ.get(PASSWORD_SOCKET) if os.environ.get(RELAYED) else None
+    if relayed and Path(relayed).exists():
+        with private_directory('remote-ssh-') as directory:
+            env.update(SSH_ASKPASS=str(write_helper(Path(directory))), SSH_ASKPASS_REQUIRE='force',
+                       DISPLAY=env.get('DISPLAY') or ':0', **{PASSWORD_SOCKET: relayed})
+            yield env
+        return
+    try:
+        with warnings.catch_warnings():  # without a terminal getpass warns, then reads stdin
+            warnings.simplefilter('ignore', getpass.GetPassWarning)
+            password = getpass.getpass(prompt)
+    except EOFError:
+        raise RuntimeError('no terminal here to ask for the SSH password: run this through '
+                           '"remote.py relay" from where you can type it') from None
     with private_directory('remote-ssh-') as directory:
         directory = Path(directory)
         endpoint = directory / 'password.sock'
-        helper = directory / 'askpass'
-        helper.write_text('#!/bin/sh\nexec ' + shlex.join(
-            [sys.executable, str(Path(__file__).resolve()), '--askpass']) + ' "$@"\n')
-        helper.chmod(0o700)
+        helper = write_helper(directory)
 
         class PasswordHandler(socketserver.StreamRequestHandler):
             def handle(self):
                 self.wfile.write((password + '\n').encode())
 
-        with socketserver.UnixStreamServer(str(endpoint), PasswordHandler) as server:
+        # Threads: under a relay, several hosts' logins can ask at once.
+        with socketserver.ThreadingUnixStreamServer(str(endpoint), PasswordHandler) as server:
             worker = threading.Thread(target=server.serve_forever,
                                       kwargs={'poll_interval': 0.1}, daemon=True)
             worker.start()
@@ -232,6 +262,34 @@ class Session:
         return path
 
 
+def run_relayed(args, command):
+    """command on args.host, with the password relayed to it: its output as it comes."""
+    if args.ssh_batch or args.password_per_node:
+        print('remote: a relay serves the password: not with --batch or --password-per-node',
+              file=sys.stderr)
+        return 2
+    target = f'{args.user}@{args.host}' if args.user and '@' not in args.host else args.host
+    there = f'/tmp/remote-password-{secrets.token_hex(8)}.sock'
+    line = (f'{PASSWORD_SOCKET}={there} {RELAYED}=1; export {PASSWORD_SOCKET} {RELAYED}; '
+            f'{command}\ns=$?; rm -f {there}; exit $s')
+    try:
+        with password_environment(True) as env:
+            # This connection alone forwards: the socket there, private to the user, to here.
+            argv = ['ssh', '-T', '-x', '-o', 'ClearAllForwardings=no',
+                    '-o', 'ExitOnForwardFailure=yes', '-o', 'StreamLocalBindUnlink=yes',
+                    '-o', 'StreamLocalBindMask=0177', '-R', f'{there}:{env[PASSWORD_SOCKET]}',
+                    *ssh_options(args.ssh_option), target, line]
+            with subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as process:
+                for said in process.stdout:
+                    if NOISE not in said:
+                        sys.stdout.write(said)
+                        sys.stdout.flush()
+            return process.returncode
+    except KeyboardInterrupt:
+        return 130
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -243,10 +301,23 @@ def main(argv=None):
     on = commands.add_parser('on', help='run a shell command on each host and show what it says')
     on.add_argument('command', nargs=argparse.REMAINDER,
                     help='after --: the shell command, one line run by the login shell there')
+    relay = commands.add_parser('relay', help='run a shell command on one host, which may log in '
+                                              'to others with this password')
+    relay.add_argument('--host', required=True, help='the host that runs the command')
+    relay.add_argument('command', nargs=argparse.REMAINDER,
+                       help='after --: the shell command, one line run by the login shell there')
     for sub in (check, run, on):
         sub.add_argument('--hosts', required=True, help='hosts, with commas between')
+    for sub in (check, run, on, relay):
         add_arguments(sub)
     args = parser.parse_args(argv)
+    if args.what == 'relay':
+        command = list(args.command)
+        if command[:1] == ['--']:
+            command = command[1:]
+        if not command:
+            parser.error('relay needs a command after --')
+        return run_relayed(args, ' '.join(command))
     hosts = [host.strip() for host in args.hosts.split(',') if host.strip()]
     if not hosts:
         parser.error('--hosts names no host')

@@ -852,10 +852,12 @@ def update(side):
     when the commit changes what is built."""
     here = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
-    if subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
-                      capture_output=True, text=True).stdout.strip():
-        print("bench: this checkout has changes that are not committed; they stay behind",
-              file=sys.stderr)
+    changed = [line[3:] for line in subprocess.run(
+        ["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True, text=True).stdout.splitlines()]
+    if changed:
+        print(f"bench: not committed here, so {side.name} gets {here} without the changes to: "
+              + ", ".join(changed), file=sys.stderr)
     root = shlex.quote(str(side.root))
     line = (f"cd {root} && old=$(git rev-parse HEAD) && cat > .bench-update.bundle && "
             "git fetch -q .bench-update.bundle HEAD && git merge -q --ff-only FETCH_HEAD; "
