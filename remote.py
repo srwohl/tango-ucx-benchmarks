@@ -101,15 +101,16 @@ def ssh_options(extra=(), batch=False):
     return options
 
 
-def add_arguments(parser):
-    """The options of a tool that reaches hosts through a Session."""
+def add_arguments(parser, batch_flag='--batch'):
+    """The options of a tool that reaches hosts through a Session. A tool whose --batch means
+    something else names this one otherwise."""
     group = parser.add_argument_group('SSH (password authentication, one login per host)')
     group.add_argument('--user', help='SSH username (otherwise SSH config or the current user)')
     group.add_argument('--ssh-option', action='append', default=[], metavar='KEY=VALUE',
                        help='extra SSH -o option, e.g. ProxyJump=login-host; repeat as needed')
     group.add_argument('--password-per-node', action='store_true',
                        help='let SSH ask for each host\'s password instead of reusing one')
-    group.add_argument('--batch', action='store_true',
+    group.add_argument(batch_flag, dest='ssh_batch', action='store_true',
                        help='no authentication prompts, for access that needs none')
     group.add_argument('--login-timeout', type=float, default=120,
                        help='seconds to log in to a host, authentication included (120)')
@@ -136,7 +137,7 @@ class Session:
 
     @classmethod
     def from_args(cls, args, hosts=None):
-        return cls(user=args.user, extra=args.ssh_option, batch=args.batch,
+        return cls(user=args.user, extra=args.ssh_option, batch=args.ssh_batch,
                    password_per_node=args.password_per_node, timeout=args.login_timeout,
                    hosts=hosts)
 

@@ -9,8 +9,8 @@
 
 A sweep made with bench.py --hdf5 also has its file's frames against generated ones. A file of
 hdf5_write.py or zarr_write.py has its writes: processes x threads, on one host or several.
-A sweep of several thread placements is reported as one sweep a placement, unpinned first, so
-"Compared" shows what placing the threads changes.
+A sweep of several thread placements, or of several transports (bench.py remote), is reported
+as one sweep each, the first one first, so "Compared" shows what each changes.
 
 The first file is what the others are compared with.
 """
@@ -37,22 +37,27 @@ def rate(value):
     return "" if value is None else f"{value:,.0f}"
 
 
-def placements_in(path):
-    """The thread placements a sweep measured, in bench.py's order; a sweep from before
-    placements were measured is unpinned."""
-    found = set()
+def variants_in(path):
+    """The (transport, placement) pairs a sweep measured: transports in the order measured,
+    placements in bench.py's. A local sweep has no transport; one from before placements were
+    measured is unpinned."""
+    transports, placements = [], set()
     with open(path) as lines:
         for line in lines:
             record = json.loads(line)
             if "frame_bytes" in record:
-                found.add(record.get("placement", "unpinned"))
-    ordered = [name for name in PLACEMENTS if name in found]
-    return ordered + sorted(found - set(PLACEMENTS)) or ["unpinned"]
+                if record.get("transport") not in transports:
+                    transports.append(record.get("transport"))
+                placements.add((record.get("transport"), record.get("placement", "unpinned")))
+    found = [(transport, name) for transport in transports
+             for name in [*PLACEMENTS, *sorted({n for _, n in placements} - set(PLACEMENTS))]
+             if (transport, name) in placements]
+    return found or [(None, "unpinned")]
 
 
-def load(path, placement="unpinned"):
-    """A sweep's host record and its points of one thread placement, each the runs of one
-    program, size and depth."""
+def load(path, placement="unpinned", transport=None):
+    """A sweep's host record and its points of one transport and thread placement, each the
+    runs of one program, size and depth."""
     meta, points = {}, {}
     with open(path) as lines:
         for line in lines:
@@ -67,10 +72,12 @@ def load(path, placement="unpinned"):
             if record.get("test") == "zarr_write":
                 meta.setdefault("zarr_writes", []).append(record)
                 continue
-            if "frame_bytes" not in record:  # a placement this host could not have
-                meta.setdefault("left_out", {})[record.get("placement")] = record.get("skipped")
+            if "frame_bytes" not in record:  # a placement or transport that could not run
+                what = " ".join(filter(None, (record.get("transport"), record.get("placement"))))
+                meta.setdefault("left_out", {})[what] = record.get("skipped")
                 continue
-            if record.get("placement", "unpinned") != placement:
+            if (record.get("placement", "unpinned") != placement
+                    or record.get("transport") != transport):
                 continue
             depth = record.get("depth_asked")
             if depth is None and isinstance(record.get("depth"), dict):
@@ -122,7 +129,8 @@ def host_section(labels, sweeps):
              ("Kernel", "kernel"), ("Governor", "governor"), ("Load at the start", "load"),
              ("tango-ucx", "tango_ucx"), ("tango-ucx-benchmarks", "benchmarks"),
              ("Tier", "tier"), ("Options", "options"), ("Settings", "settings"),
-             ("Placement", "placement")]
+             ("Placement", "placement"), ("Transport", "transport"),
+             ("Publisher host", "publisher_host")]
     for title, key in names:
         rows.append([title] + [str(meta.get(key, "not recorded")) for meta, _ in sweeps])
     lines = ["## What was measured", ""]
@@ -137,7 +145,7 @@ def host_section(labels, sweeps):
         if "dirty" in str(meta.get("tango_ucx", "")) + str(meta.get("benchmarks", "")):
             notes.append("a checkout had changes that are in no commit")
         for name, why in meta.get("left_out", {}).items():
-            notes.append(f"placement {name} was left out: {why}")
+            notes.append(f"{name} was left out: {why}")
         if notes:
             lines.append(f"- **{label}:** " + "; ".join(notes) + ".")
     return lines + [""]
@@ -430,18 +438,23 @@ def main():
         parser.error("as many labels as files")
     sweeps, names = [], []
     for label, path in zip(labels, args.results):
-        found = placements_in(path)
-        for number, placement in enumerate(found):
-            meta, points = load(path, placement)
+        found = variants_in(path)
+        for number, (transport, placement) in enumerate(found):
+            meta, points = load(path, placement, transport)
             if number:  # a file's writes and notes are its first placement's
                 meta = {k: v for k, v in meta.items() if k not in ("writes", "zarr_writes",
                                                                   "left_out")}
             cpus = next((run.get("cpus") for point in points.values() for run in point["runs"]
                          if run.get("cpus")), None)
+            first = next((run for point in points.values() for run in point["runs"]), {})
             meta = {**meta, "placement": placement + (
-                f", CPUs {','.join(map(str, cpus))}" if cpus else "")}
+                f", CPUs {','.join(map(str, cpus))}" if cpus else ""),
+                "transport": (f"{transport} ({' '.join(f'{k}={v}' for k, v in sorted(first.get('transport_settings', {}).items())) or 'UCX defaults'})"
+                              if transport else "local"),
+                "publisher_host": first.get("publisher_host", meta.get("host", ""))}
             sweeps.append((meta, points))
-            names.append(label if len(found) == 1 else f"{label}, {placement}")
+            parts = [part for part in (transport, placement) if part]
+            names.append(label if len(found) == 1 else f"{label}, {', '.join(parts)}")
     labels = names
 
     lines = ["# tango-ucx against ucx_perftest", ""]

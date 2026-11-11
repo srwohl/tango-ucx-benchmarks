@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Copyright contributors to the tango-ucx project
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Run tango_ucx_perftest over a list of frame sizes, with both roles on this host.
+"""Run tango_ucx_perftest over a list of frame sizes, with both roles on this host (local), or
+the publisher on another host and the subscriber here (remote).
 
 With --reference, or a --tier, ucx_perftest runs at each size too. A point whose rings do not
 fit this host's memory is left out, and said to be.
@@ -15,13 +16,24 @@ ucx_perftest references with theirs placed alike:
     one-l3      four cores that share one L3 cache
     spread-l3   the publisher's two threads and the subscriber's two on different L3 caches
 On a CPU of several L3 caches, as an EPYC of several chiplets, these can differ several times.
+
+remote runs the publisher on --peer and the subscriber here, or on --subscriber, so the sweep
+can be run from a workstation. It reaches the hosts through remote.py: one password, one login
+each. They need a deployment (deploy.sh puts it in /tmp/USER/tango-ucx), and each
+--transports variant runs with the same UCX settings on both:
+    default         UCX's own choice: every port it finds
+    rdma:DEVICES    UCX_NET_DEVICES=DEVICES, as rdma:mlx5_2:1; join several with +
+    tcp:INTERFACE   UCX_TLS=tcp on that interface, as tcp:ens4f0np0
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import random
 import resource
 import re
+import shlex
+import shutil
 import signal
 import socket
 import statistics
@@ -31,6 +43,8 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+import remote as remote_login  # noqa: E402
 UNITS = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
 
 
@@ -142,7 +156,7 @@ def left_out(frame_bytes, depth, args, read_ahead=0):
     # A publisher has at least three slots, and one more for each frame read ahead; ucx_perftest
     # has a buffer on each side.
     need = frame_bytes * (2 if depth is None else max(depth, 3) + read_ahead + depth)
-    free = available_bytes()
+    free = getattr(args, "memory_available", None) or available_bytes()
     if free is not None and need > free * args.memory_share:
         return (f"needs {need / (1 << 30):.1f} GiB, and {args.memory_share:.0%} of the "
                 f"{free / (1 << 30):.1f} GiB available is the most a point takes")
@@ -273,7 +287,10 @@ def read_ahead_of(program, args):
     return args.read_ahead if program == HDF5 else 0
 
 
-def run_point(build, device, frame_bytes, depth, args, hdf5=False, cpus=None):
+def run_point(build, device, frame_bytes, depth, args, hdf5=False, cpus=None, env=None,
+              runner=None):
+    """One run of tango_ucx_perftest: here, or through runner(command), which runs it
+    elsewhere and returns what it said."""
     size = (hdf5_options(args) + ["--read-ahead", str(args.read_ahead)] if hdf5
             else ["-s", str(frame_bytes)])
     command = [str(build / "tango_ucx_perftest"), device, "-t", "bw", *size,
@@ -287,7 +304,9 @@ def run_point(build, device, frame_bytes, depth, args, hdf5=False, cpus=None):
         command += ['--rate', str(args.rate)]
     if cpus:
         command += ['--thread-cpus', ','.join(map(str, cpus))]
-    done = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    done = (runner(command) if runner else
+            subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                           env=env))
     lines = done.stdout.strip().splitlines()
     if not lines or not lines[-1].startswith("{"):
         said = done.stderr.strip().splitlines()
@@ -405,18 +424,21 @@ def rows_of(args):
     return rows + [(HDF5, depth) for depth in args.depth if args.hdf5]
 
 
-def placement_line(name, cpus, unavailable):
+
+
+def placement_line(name, cpus, unavailable, peer=None):
     if unavailable:
         return f"# placement {name}: left out: {unavailable}"
     if cpus is None:
         return f"# placement {name}: threads where the scheduler puts them"
+    if peer:
+        return (f"# placement {name}: CPUs {cpus[0]},{cpus[1]} on {peer} for the publisher loop "
+                f"and producer, {cpus[2]},{cpus[3]} here for the subscriber loop and reader")
     return (f"# placement {name}: CPUs {','.join(map(str, cpus))} for the publisher loop, "
             "producer, subscriber loop and reader")
 
 
-def local(args):
-    build = Path(args.build).resolve()
-    host = describe_host(args)
+def print_host(host):
     print(f"# {host['date']}  {host['host']}  Linux {host['kernel']}")
     print(f"# {host['cpu']}, {host['cpus']} CPUs, governor {host['governor']}, "
           f"load {host['load']:.2f}")
@@ -427,6 +449,107 @@ def local(args):
     if host["load"] > 1.0:
         print(f"bench: the host is busy, load {host['load']:.2f}: rates will vary from run to "
               "run", file=sys.stderr)
+
+
+def dry_run(args, plan):
+    points = runs = 0
+    for name, cpus, unavailable, line in plan:
+        print(line)
+        if unavailable:
+            continue
+        for frame_bytes in args.sizes:
+            for program, depth in rows_of(args):
+                why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
+                print(f"{frame_bytes:>10}  {program:<16} {'' if depth is None else depth:>5} "
+                      f"{frames_for(frame_bytes, args):>8} frames  "
+                      + (f"left out: {why}" if why else f"{args.runs} runs"))
+                points += not why
+                runs += 0 if why else args.runs
+    return points, runs
+
+
+TABLE_HEAD = (f"{'#bytes':>10}  {'program':<16} {'depth':>5} {'#frames':>8} {'frames/s':>12} "
+              f"{'MiB/s':>10} {'best':>9} {'worst':>9} {'of raw':>7}  path")
+
+
+def measure(args, out, publisher, plan, point_of, tag=None):
+    """Each placement of the plan, each frame size, each row: its runs, their median and the
+    table line. point_of(program, frame_bytes, depth, cpus) measures one run. Returns the points
+    that failed, or None when the publisher ended. tag goes on every line written."""
+    # One run says little on a machine that is doing anything else: the median of the runs
+    # is the figure, and the best and the worst are beside it. "of raw" is tango-ucx against
+    # ucx_perftest as tango-ucx asks, placed alike.
+    tag = tag or {}
+    failed = 0
+    for name, cpus, unavailable, line in plan:
+        print(line)
+        if unavailable:
+            if out:
+                out.write(json.dumps({**tag, "placement": name, "skipped": unavailable}) + "\n")
+            continue
+        for frame_bytes in args.sizes:
+            raw = None
+            for program, depth in rows_of(args):
+                why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
+                if why:
+                    print(f"{frame_bytes:>10}  {program:<16} "
+                          f"{'' if depth is None else depth:>5} left out: {why}")
+                    if out:
+                        out.write(json.dumps({**tag, "program": program, "frame_bytes": frame_bytes,
+                                              "depth_asked": depth, "placement": name,
+                                              "skipped": why}) + "\n")
+                    continue
+                runs = []
+                for run in range(args.runs):
+                    if publisher.process.poll() is not None:
+                        print("the publisher ended:\n" + publisher.said(), file=sys.stderr)
+                        return None
+                    point = point_of(program, frame_bytes, depth, cpus)
+                    point.update(tag)
+                    point["depth_asked"] = depth
+                    point["run"] = run
+                    point["placement"], point["cpus"] = name, cpus
+                    if out:
+                        out.write(json.dumps(point) + "\n")
+                        out.flush()
+                    runs.append(point)
+                bad = [p for p in runs if not p.get("ok")]
+                if bad:
+                    p = bad[0]
+                    why = (f"{p['outcome']}, {p['mismatched']} mismatched of "
+                           f"{p['mismatched_expected']} expected" if "outcome" in p
+                           else p.get("failure", ""))
+                    print(f"{frame_bytes:>10}  {program:<16} FAILED in {len(bad)} of {len(runs)} "
+                          f"runs: {why}")
+                    failed += 1
+                    continue
+                rates = sorted(p["MiB_per_second"] for p in runs)
+                median = statistics.median(rates)
+                middle = min(runs, key=lambda p: abs(p["MiB_per_second"] - median))
+                if program == "ucx_perftest -e":
+                    raw = median
+                share = f"{100 * median / raw:.0f}%" if raw and depth is not None else ""
+                print(f"{frame_bytes:>10}  {program:<16} "
+                      f"{'' if depth is None else middle['depth']['subscription']:>5} "
+                      f"{middle['frames']:>8} {middle['frames_per_second']:>12.1f} "
+                      f"{median:>10.1f} {rates[-1]:>9.1f} {rates[0]:>9.1f} {share:>7}  "
+                      f"{middle['protocol'] if depth is None else middle['lanes']}")
+    return failed
+
+
+def open_out(args, host):
+    if not args.out:
+        return None
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    out = open(args.out, "a")
+    out.write(json.dumps({"meta": host}) + "\n")
+    return out
+
+
+def local(args):
+    build = Path(args.build).resolve()
+    host = describe_host(args)
+    print_host(host)
     if args.hdf5:
         source = host["source"] = describe_file(build, args)
         args.sizes = [source["frame_bytes"]]
@@ -436,123 +559,376 @@ def local(args):
               f"{'x'.join(map(str, source['shape']))}, {source['frames']} frames, "
               f"{source['layout']}{filters}{rate}")
     host["l3_caches"] = l3_caches()
-    plan = [(name, *placement_cpus(name, host["l3_caches"])) for name in args.placement]
+    plan = []
+    for name in args.placement:
+        cpus, unavailable = placement_cpus(name, host["l3_caches"])
+        plan.append((name, cpus, unavailable, placement_line(name, cpus, unavailable)))
     if args.dry_run:
-        points = runs = 0
-        for name, cpus, unavailable in plan:
-            print(placement_line(name, cpus, unavailable))
-            if unavailable:
-                continue
-            for frame_bytes in args.sizes:
-                for program, depth in rows_of(args):
-                    why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
-                    print(f"{frame_bytes:>10}  {program:<16} {'' if depth is None else depth:>5} "
-                          f"{frames_for(frame_bytes, args):>8} frames  "
-                          + (f"left out: {why}" if why else f"{args.runs} runs"))
-                    points += not why
-                    runs += 0 if why else args.runs
+        points, runs = dry_run(args, plan)
         print(f"# {points} points, {runs} runs")
         return 0
-    out = None
-    if args.out:
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        out = open(args.out, "a")
-        out.write(json.dumps({"meta": host}) + "\n")
-    failed = 0
+    out = open_out(args, host)
     with Publisher(build) as publisher:
-        # One run says little on a machine that is doing anything else: the median of the runs
-        # is the figure, and the best and the worst are beside it. "of raw" is tango-ucx against
-        # ucx_perftest as tango-ucx asks.
-        print(f"{'#bytes':>10}  {'program':<16} {'depth':>5} {'#frames':>8} {'frames/s':>12} "
-              f"{'MiB/s':>10} {'best':>9} {'worst':>9} {'of raw':>7}  path")
-        for name, cpus, unavailable in plan:
-            print(placement_line(name, cpus, unavailable))
-            if unavailable:
+        print(TABLE_HEAD)
+
+        def point_of(program, frame_bytes, depth, cpus):
+            if depth is None:
+                return run_reference(program, frame_bytes, args, cpus)
+            point = run_point(build, publisher.device, frame_bytes, depth, args,
+                              hdf5=program == HDF5, cpus=cpus)
+            point["program"] = program
+            return point
+
+        failed = measure(args, out, publisher, plan, point_of)
+    return 1 if failed is None or failed else 0
+
+
+# --- remote: the publisher on another host -------------------------------------------------
+
+def transports(text):
+    """default, rdma:DEVICES and tcp:INTERFACE, with commas between; + joins devices."""
+    found = []
+    for part in (part.strip() for part in text.split(",")):
+        kind, _, where = part.partition(":")
+        where = where.replace("+", ",")
+        if kind == "default" and not where:
+            found.append((part, {}))
+        elif kind == "rdma" and where:
+            found.append((part, {"UCX_NET_DEVICES": where}))
+        elif kind == "tcp" and where:
+            found.append((part, {"UCX_TLS": "tcp", "UCX_NET_DEVICES": where}))
+        else:
+            raise argparse.ArgumentTypeError(
+                f"{part}: a transport is default, rdma:DEVICES or tcp:INTERFACE")
+    return found
+
+
+def side_cpus(name, caches):
+    """The CPUs of one host's two threads for a placement, and why there are none."""
+    if name == "unpinned":
+        return None, None
+    if name == "one-l3":
+        group = next((group for group in caches if len(group) >= 2), None)
+        return (group[:2], None) if group else (None, "no L3 cache has two allowed cores")
+    if len(caches) < 2:
+        return None, "one L3 cache: nothing to spread across"
+    return [caches[0][0], caches[1][0]], None
+
+
+def forwarded():
+    """The settings of this environment that both roles must share."""
+    return {name: value for name, value in os.environ.items()
+            if name.startswith(("UCX_", "TANGO_UCX_")) and name != "TANGO_UCX_SOURCE"}
+
+
+def words(settings):
+    return [f"{name}={value}" for name, value in sorted(settings.items())]
+
+
+# Run by sh, a command in the background that is killed when sh's input closes: when the sweep
+# ends or the login is lost. Killing the local ssh alone would leave it running there. A
+# background job's input is /dev/null unless redirected, so the watcher reads it through
+# descriptor 3, and the command reads none of it.
+WATCH = ('exec 3<&0; "$@" 3<&- & p=$!; '
+         '{ cat <&3 >/dev/null; kill -TERM $p 2>/dev/null; } >/dev/null 2>&1 & '
+         'exec 3<&-; wait $p')
+
+# Waits there until a server answers: every address of its name, as one can listen on IPv6
+# alone. From the host that connects, which this one need not be able to reach.
+ANSWERS = ("import socket, sys, time\n"
+           "for _ in range(int(sys.argv[3])):\n"
+           "    try:\n"
+           "        socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=1).close()\n"
+           "        sys.exit(0)\n"
+           "    except OSError:\n"
+           "        time.sleep(0.1)\n"
+           "sys.exit(1)\n")
+
+
+class Side:
+    """Where a role runs: this host, or another through the run's login, and the deployment
+    there. A command gets its settings with env and its CPU with taskset."""
+
+    def __init__(self, session, host, root):
+        self.session, self.host = session, host
+        if host is None:  # this host: this checkout and this environment
+            self.name = socket.gethostname().split(".")[0]
+            self.root, self.python = ROOT, Path(sys.executable)
+            self.perftest = Path(shutil.which("ucx_perftest") or "ucx_perftest")
+        else:
+            self.name = host.rsplit("@", 1)[-1]
+            self.root = Path(root)
+            self.python = self.root / ".pixi/envs/default/bin/python"
+            self.perftest = self.root / ".pixi/envs/default/bin/ucx_perftest"
+
+    def argv(self, command, settings=None, slot=0, cpu=None, watched=False):
+        line = ["env", *words(settings or {})]
+        if watched:
+            line += ["sh", "-c", WATCH, "sh"]
+        if cpu is not None:
+            line += ["taskset", "-c", str(cpu)]
+        line += [str(word) for word in command]
+        if self.host is None:
+            return line
+        return self.session.argv(self.host, f"cd {shlex.quote(str(self.root))} && "
+                                 + shlex.join(line), slot)
+
+    def run(self, command, settings=None, slot=0, cpu=None, timeout=600):
+        return subprocess.run(self.argv(command, settings, slot, cpu), text=True,
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                              cwd=self.root if self.host is None else None)
+
+    def start(self, command, settings=None, slot=0, cpu=None, log=None):
+        """A watched command: stop() closes its input, and so ends it there."""
+        return subprocess.Popen(self.argv(command, settings, slot, cpu, watched=True),
+                                stdin=subprocess.PIPE, stdout=log or subprocess.DEVNULL,
+                                stderr=subprocess.STDOUT)
+
+    def answers(self, address, port, seconds=30):
+        done = self.run([self.python, "-c", ANSWERS, address, port, int(seconds * 10)],
+                        slot=1, timeout=seconds + 60)
+        return done.returncode == 0
+
+    def describe(self):
+        if self.host is None:
+            host = describe_host(argparse.Namespace(tier=None))
+            host["l3_caches"] = l3_caches()
+            return host
+        done = self.run([self.python, "bench.py", "describe"], timeout=120)
+        lines = [line for line in done.stdout.splitlines() if line.startswith("{")]
+        if done.returncode or not lines:
+            said = (done.stderr.strip() or done.stdout.strip()).splitlines()
+            raise SystemExit(f"bench: {self.host} has no deployment at {self.root} that "
+                             "answers: " + (said[-1] if said else "no answer"))
+        return json.loads(lines[-1])
+
+
+def stop(process, seconds=15):
+    try:
+        process.stdin.close()
+        process.wait(seconds)
+    except (OSError, subprocess.TimeoutExpired):
+        process.kill()
+        process.wait()
+
+
+def deployment(session, host, given):
+    """Where the benchmarks are deployed on host: given, or deploy.env's place for the user
+    the login is, /tmp/USER/tango-ucx."""
+    if given:
+        return given
+    done = subprocess.run(session.argv(host, 'cd "/tmp/$(id -un)/tango-ucx/tango-ucx-benchmarks"'
+                                             ' && pwd'),
+                          text=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    if done.returncode or not done.stdout.strip():
+        raise SystemExit(f"bench: no deployment in /tmp/USER/tango-ucx on {host}: run deploy.sh "
+                         "there, or give --remote-root")
+    return done.stdout.strip().splitlines()[-1]
+
+
+class RemotePublisher:
+    """tango_ucx_perf_publisher on the peer, with the settings given, stopped when the block
+    ends. Whether it listens is asked from the subscriber's host, which connects to it."""
+
+    def __init__(self, peer, subscriber, settings):
+        self.address = peer.name
+        for _ in range(5):
+            self.port = random.randint(20000, 59999)
+            self.device = f"{self.address}:{self.port}/bench/ucx/1#dbase=no"
+            self.log = tempfile.TemporaryFile(mode="w+")
+            self.process = peer.start(
+                [peer.root / "build/tango_ucx_perf_publisher", "bench", "-nodb", "-dlist",
+                 "bench/ucx/1", "-ORBendPoint", f"giop:tcp:{self.address}:{self.port}"],
+                settings, slot=0, log=self.log)
+            if subscriber.answers(self.address, self.port) and self.process.poll() is None:
+                return
+            said = self.said()
+            stop(self.process)
+            self.log.close()
+        raise RuntimeError(f"the publisher did not start on {self.address}: "
+                           + (said.strip().splitlines() or ["no output"])[-1])
+
+    def said(self):
+        self.log.seek(0)
+        return self.log.read()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        stop(self.process)
+        self.log.close()
+
+
+def run_remote_reference(name, frame_bytes, args, cpus, peer, subscriber, settings):
+    """ucx_perftest from the peer to the subscriber's host: the client there sends, as
+    tango-ucx's publisher does; the server receives, on the subscriber loop's CPU."""
+    flags, extra = REFERENCES[name]
+    frames = frames_for(frame_bytes, args)
+    port = random.randint(20000, 59999)
+    common = ["-t", "ucp_am_bw", "-s", str(frame_bytes), "-n", str(frames),
+              "-w", str(max(10, frames // 10)), "-p", str(port)] + flags
+    point = {"program": name, "ok": False, "frame_bytes": frame_bytes, "frames": frames,
+             "command": " ".join(["ucx_perftest", subscriber.name, *common]), "settings": extra}
+    server = subscriber.start([subscriber.perftest, *common], {**settings, **extra}, slot=1,
+                              cpu=cpus[2] if cpus else None)
+    try:
+        # The server listens a moment after it starts: the client's side is tried again.
+        for _ in range(50):
+            time.sleep(0.2)
+            done = peer.run([peer.perftest, subscriber.name, *common],
+                            {**settings, **extra, "UCX_PROTO_INFO": "y"}, slot=1,
+                            cpu=cpus[0] if cpus else None, timeout=300)
+            said = done.stdout + done.stderr
+            final = [line.split() for line in said.splitlines()
+                     if line.lstrip().startswith("Final:")]
+            if final or server.poll() is not None:
+                break
+        if not final:
+            return {**point, "failure": said.strip().splitlines()[-1:] or "no result"}
+        rate = float(final[-1][6])
+        return {**point, "ok": True, "frames_per_second": float(final[-1][8]),
+                "MiB_per_second": rate, "Gb_per_second": rate * (1 << 20) * 8 / 1e9,
+                "protocol": protocols(said, frame_bytes)}
+    finally:
+        stop(server, 10)
+
+
+def describe():
+    """This host, for a remote sweep run from another: bench.py describe."""
+    host = describe_host(argparse.Namespace(tier=None))
+    host["l3_caches"] = l3_caches()
+    print(json.dumps(host))
+    return 0
+
+
+def remote(args):
+    hosts = {args.peer: 2}
+    if args.subscriber:
+        hosts[args.subscriber] = 2
+    with remote_login.Session.from_args(args, hosts) as session:
+        peer = Side(session, args.peer, deployment(session, args.peer, args.remote_root))
+        subscriber = (Side(session, args.subscriber,
+                           deployment(session, args.subscriber, args.remote_root))
+                      if args.subscriber else Side(session, None, None))
+        if args.address:
+            subscriber.name = args.address
+        host = subscriber.describe()
+        other = peer.describe()
+        # The subscriber's host is the host of the sweep; what ran it and how is recorded too.
+        host.update(tier=args.tier, options=" ".join(sys.argv[1:]),
+                    settings=" ".join(words(forwarded())) or "none", peer=other,
+                    controller=socket.gethostname().split(".")[0],
+                    controller_benchmarks=revision(ROOT))
+        print_host(host)
+        print(f"# publisher on {other['host']}: {other['cpu']}, tango-ucx {other['tango_ucx']}  "
+              f"tango-ucx-benchmarks {other['benchmarks']}")
+        if args.subscriber:
+            print(f"# run from {host['controller']}, tango-ucx-benchmarks "
+                  f"{host['controller_benchmarks']}")
+        for key in ("tango_ucx", "benchmarks"):
+            if other[key] != host[key]:
+                print(f"bench: {key} differs: {other[key]} on {other['host']}, {host[key]} on "
+                      f"{host['host']}", file=sys.stderr)
+        args.memory_available = min(filter(None, (host.get("memory_available"),
+                                                  other.get("memory_available"))), default=None)
+        plan = []
+        for name in args.placement:
+            there, why_there = side_cpus(name, other["l3_caches"])
+            here, why_here = side_cpus(name, host["l3_caches"])
+            why = (f"on {other['host']}: {why_there}" if why_there else
+                   f"on {host['host']}: {why_here}" if why_here else None)
+            cpus = there + here if there and here else None
+            line = placement_line(name, cpus, why, other["host"])
+            if args.subscriber:
+                line = line.replace(" here ", f" on {host['host']} ")
+            plan.append((name, cpus, why, line))
+        if args.dry_run:
+            points = runs = 0
+            for transport, settings in args.transports:
+                print(f"# transport {transport}: {' '.join(words(settings)) or 'UCX defaults'}")
+                more = dry_run(args, plan)
+                points, runs = points + more[0], runs + more[1]
+            print(f"# {points} points, {runs} runs")
+            return 0
+        out = open_out(args, host)
+        failed = 0
+        print(TABLE_HEAD)
+        for transport, settings in args.transports:
+            both = {**forwarded(), **settings}
+            print(f"# transport {transport}: {' '.join(words(settings)) or 'UCX defaults'}")
+            try:
+                publisher = RemotePublisher(peer, subscriber, both)
+            except RuntimeError as error:
+                print(f"# transport {transport}: FAILED: {error}")
                 if out:
-                    out.write(json.dumps({"placement": name, "skipped": unavailable}) + "\n")
+                    out.write(json.dumps({"transport": transport, "skipped": str(error)}) + "\n")
+                failed += 1
                 continue
-            for frame_bytes in args.sizes:
-                raw = None
-                for program, depth in rows_of(args):
-                    why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
-                    if why:
-                        print(f"{frame_bytes:>10}  {program:<16} "
-                              f"{'' if depth is None else depth:>5} left out: {why}")
-                        if out:
-                            out.write(json.dumps({"program": program, "frame_bytes": frame_bytes,
-                                                  "depth_asked": depth, "placement": name,
-                                                  "skipped": why}) + "\n")
-                        continue
-                    runs = []
-                    for run in range(args.runs):
-                        if publisher.process.poll() is not None:
-                            print("the publisher ended:\n" + publisher.said(), file=sys.stderr)
-                            return 1
-                        if depth is None:
-                            point = run_reference(program, frame_bytes, args, cpus)
-                        else:
-                            point = run_point(build, publisher.device, frame_bytes, depth, args,
-                                              hdf5=program == HDF5, cpus=cpus)
-                            point["program"] = program
-                        point["depth_asked"] = depth
-                        point["run"] = run
-                        point["placement"], point["cpus"] = name, cpus
-                        if out:
-                            out.write(json.dumps(point) + "\n")
-                            out.flush()
-                        runs.append(point)
-                    bad = [p for p in runs if not p.get("ok")]
-                    if bad:
-                        p = bad[0]
-                        why = (f"{p['outcome']}, {p['mismatched']} mismatched of "
-                               f"{p['mismatched_expected']} expected" if "outcome" in p
-                               else p.get("failure", ""))
-                        print(f"{frame_bytes:>10}  {program:<16} FAILED in {len(bad)} of {len(runs)} "
-                              f"runs: {why}")
-                        failed += 1
-                        continue
-                    rates = sorted(p["MiB_per_second"] for p in runs)
-                    median = statistics.median(rates)
-                    middle = min(runs, key=lambda p: abs(p["MiB_per_second"] - median))
-                    if program == "ucx_perftest -e":
-                        raw = median
-                    share = f"{100 * median / raw:.0f}%" if raw and depth is not None else ""
-                    print(f"{frame_bytes:>10}  {program:<16} "
-                          f"{'' if depth is None else middle['depth']['subscription']:>5} "
-                          f"{middle['frames']:>8} {middle['frames_per_second']:>12.1f} "
-                          f"{median:>10.1f} {rates[-1]:>9.1f} {rates[0]:>9.1f} {share:>7}  "
-                          f"{middle['protocol'] if depth is None else middle['lanes']}")
+            with publisher:
+                def point_of(program, frame_bytes, depth, cpus):
+                    if depth is None:
+                        return run_remote_reference(program, frame_bytes, args, cpus, peer,
+                                                    subscriber, both)
+                    build = (Path(args.build).resolve() if subscriber.host is None
+                             else subscriber.root / "build")
+                    point = run_point(build, publisher.device, frame_bytes,
+                                      depth, args, cpus=cpus,
+                                      runner=lambda command: subscriber.run(command, both))
+                    point["program"] = program
+                    return point
+
+                done = measure(args, out, publisher, plan, point_of,
+                               tag={"transport": transport, "transport_settings": settings,
+                                    "publisher_host": other["host"],
+                                    "subscriber_host": host["host"]})
+            if done is None:
+                return 1
+            failed += done
     return 1 if failed else 0
 
 
+def sweep_options(parser):
+    """The options of a sweep, local or remote."""
+    parser.add_argument("--tier", choices=TIERS,
+                        help="a sweep with ucx_perftest beside it: " + "; ".join(
+                            f"{name}: {tier['sizes']} at depth "
+                            f"{','.join(map(str, tier['depth']))}, {tier['runs']} runs"
+                            for name, tier in TIERS.items()))
+    parser.add_argument("--sizes", type=sizes,
+                        help="frame sizes with K, M or G; 1K..64M is every power of two between "
+                             "(4K,64K,1M,8M)")
+    parser.add_argument("--bytes", type=size, help="what each point moves, measured (2G)")
+    parser.add_argument("--min-frames", type=int, default=200)
+    parser.add_argument("--max-frames", type=int, default=200_000)
+    parser.add_argument("--depth", type=lambda s: [int(x) for x in s.split(",")],
+                        help="ring depths on both sides, each a row (32)")
+    parser.add_argument("--reference", action="store_true", default=None,
+                        help="run ucx_perftest at each size too, as UCX chooses and as "
+                             "tango-ucx asks")
+    parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--runs", type=int, help="runs of each point (3)")
+    parser.add_argument("--memory-share", type=float, default=0.5,
+                        help="the most of the available memory a point's rings may take (0.5)")
+    parser.add_argument("--verify", action="store_true", help="check every byte; costs bandwidth")
+    parser.add_argument("--corrupt-every", type=int, default=0,
+                        help="damage every nth frame; the run passes when exactly those are found")
+    parser.add_argument("--dry-run", action="store_true", help="list the points and run none")
+    parser.add_argument("--placement", type=placements,
+                        help="thread placements, each a block of rows: " + ", ".join(PLACEMENTS)
+                             + " (local: unpinned, and all three with a tier; remote: "
+                               "unpinned,one-l3)")
+    parser.add_argument("--build", default=os.environ.get("BENCH_BUILD", ROOT / "build"))
+    parser.add_argument("--out", help="append each point's JSON line to this file")
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     roles = parser.add_subparsers(dest="where", required=True)
     one = roles.add_parser("local", help="both roles on this host")
-    one.add_argument("--tier", choices=TIERS,
-                     help="a sweep with ucx_perftest beside it: " + "; ".join(
-                         f"{name}: {tier['sizes']} at depth "
-                         f"{','.join(map(str, tier['depth']))}, {tier['runs']} runs"
-                         for name, tier in TIERS.items()))
-    one.add_argument("--sizes", type=sizes,
-                     help="frame sizes with K, M or G; 1K..64M is every power of two between "
-                          "(4K,64K,1M,8M)")
-    one.add_argument("--bytes", type=size, help="what each point moves, measured (2G)")
-    one.add_argument("--min-frames", type=int, default=200)
-    one.add_argument("--max-frames", type=int, default=200_000)
-    one.add_argument("--depth", type=lambda s: [int(x) for x in s.split(",")],
-                     help="ring depths on both sides, each a row (32)")
-    one.add_argument("--reference", action="store_true", default=None,
-                     help="run ucx_perftest at each size too, as UCX chooses and as tango-ucx asks")
-    one.add_argument("--batch", type=int, default=1)
+    sweep_options(one)
     one.add_argument("--rate", type=int, default=0, help="paced frames/s; latency needs one host")
-    one.add_argument("--runs", type=int, help="runs of each point (3)")
-    one.add_argument("--memory-share", type=float, default=0.5,
-                     help="the most of the available memory a point's rings may take (0.5)")
-    one.add_argument("--verify", action="store_true", help="check every byte; costs bandwidth")
-    one.add_argument("--corrupt-every", type=int, default=0,
-                     help="damage every nth frame; the run passes when exactly those are found")
-    one.add_argument("--dry-run", action="store_true", help="list the points and run none")
     one.add_argument("--hdf5", help="also publish this image stack's frames, beside generated "
                                     "ones of its frame size")
     one.add_argument("--hdf5-dataset", help="the dataset, when the file has no NeXus "
@@ -560,13 +936,28 @@ def main():
     one.add_argument("--read-ahead", type=int, default=8,
                      help="with --hdf5: frames read before they are published, in source slots "
                           "beyond the depth; 0 reads each as it is sent (8)")
-    one.add_argument("--placement", type=placements,
-                     help="thread placements, each a block of rows: " + ", ".join(PLACEMENTS)
-                          + " (unpinned; a tier runs all three)")
-    one.add_argument("--build", default=os.environ.get("BENCH_BUILD", ROOT / "build"))
-    one.add_argument("--out", help="append each point's JSON line to this file")
     one.set_defaults(run=local)
+    two = roles.add_parser("remote", help="the publisher on --peer, the subscriber here or on "
+                                          "--subscriber")
+    sweep_options(two)
+    two.add_argument("--peer", required=True, help="the publisher's host, as ssh reaches it")
+    two.add_argument("--subscriber", help="the subscriber's host, as ssh reaches it; this host "
+                                          "then only runs the sweep (without it, the "
+                                          "subscriber runs here)")
+    two.add_argument("--remote-root",
+                     help="the deployed benchmarks on the other hosts "
+                          "(/tmp/USER/tango-ucx/tango-ucx-benchmarks, as deploy.sh puts them)")
+    two.add_argument("--address", help="the subscriber's name as the peer reaches it "
+                                       "(its short name)")
+    two.add_argument("--transports", type=transports, default=transports("default"),
+                     help="default, rdma:DEVICES, tcp:INTERFACE, with commas between (default)")
+    remote_login.add_arguments(two, batch_flag='--ssh-batch')
+    two.set_defaults(run=remote, rate=0, hdf5=None, hdf5_dataset=None, read_ahead=0)
+    roles.add_parser("describe", help="this host as JSON, for a remote sweep run elsewhere")
     args = parser.parse_args()
+    if args.where == "describe":
+        return describe()
+    placement_given = args.placement is not None
     usual = dict(sizes="4K,64K,1M,8M", depth=[32], runs=3, bytes="2G", reference=False,
                  placement=["unpinned"])
     if args.tier:
@@ -574,6 +965,9 @@ def main():
     for name, value in usual.items():
         if getattr(args, name) is None:
             setattr(args, name, {"sizes": sizes, "bytes": size}.get(name, lambda v: v)(value))
+    if args.where == "remote" and not placement_given:
+        # Spread across one host's caches says little of a network; pinned and not is the point.
+        args.placement = ["unpinned", "one-l3"]
     if not 0 <= args.rate <= 1_000_000_000:
         parser.error('--rate must be between zero and one billion frames/s')
     if args.rate and args.reference:
@@ -589,7 +983,11 @@ def main():
             parser.error(f"no file {args.hdf5}")
         args.hdf5 = str(Path(args.hdf5).resolve())
     started = time.monotonic()
-    status = args.run(args)
+    try:
+        status = args.run(args)
+    except RuntimeError as error:  # a login that failed
+        print(f"bench: {error}", file=sys.stderr)
+        status = 1
     print(f"# {time.monotonic() - started:.1f} s", file=sys.stderr)
     return status
 
