@@ -45,6 +45,8 @@ zlib = "*"
 # The driver reads the stitched capture back with the reference reader, and with tensorstore.
 zarr = ">=3.1"
 tensorstore = "*"
+ome-zarr-models = ">=1.9.0,<2"
+ome-zarr = ">=0.21.0,<0.22"
 
 [feature.zarr.tasks]
 stage-zarr = "bash stage_zarr.sh"

@@ -3,16 +3,17 @@
 
 // tango_ucx_zarr_writer: frames of a tango_ucx_perf_publisher written to Zarr v3 parts by
 // acquire-zarr. The counterpart of tango_ucx_hdf5_writer: each writer thread is a puller of the
-// publisher's pull set and owns one part, a store with one array, /images, that grows by the
+// publisher's pull set and owns one part, a store with one OME-Zarr image, /images, that grows by the
 // frames it is given. A batch is appended straight from the receive ring and then released.
 // Unlike H5Dwrite, an append copies the frames into the stream's queue and returns, and the
 // stream's own threads compress and write them, so a writer's credit returns before its frames
 // are on disk. ZarrStream_close waits for them and makes each shard file durable. Streams share
 // nothing: there is no lock between the threads of a process.
 //
-// A part is made of whole shards of the stream: the publisher gives a puller ranges of R frames
-// that start at multiples of R, and R is a whole number of shards. zarr_write.py then makes one
-// native Zarr store of the run whose shard files are links to the parts' shard files.
+// A part's shards hold its own frames in the order it was given them, as an HDF5 shard file
+// does, and a shard can span many of its ranges. When a shard divides the range R, every shard
+// of a part is also a shard of the stream, since ranges start at multiples of R, and
+// zarr_write.py makes one native Zarr store of the run whose shard files are links to the parts'.
 //
 //   configure <device> --depth <d> <json>   the publisher's Configure, at the source depth d
 //   start <device>                          its Start
@@ -62,7 +63,7 @@ const char *const k_usage =
     "  --blocks-per-stripe <b>  blocks a writer takes at its turn: the pull range is f * b (1)\n"
     "  --queue <q>              ranges each receive ring holds (2)\n"
     "  --chunk-frames <c>       frames in a Zarr chunk (the block)\n"
-    "  --shard-chunks <s>       chunks in a shard file; c * s must divide the range (range / c)\n"
+    "  --shard-chunks <s>       chunks in a shard file, which may span ranges (range / c)\n"
     "  --compression <kind>     none, blosc-lz4, blosc-zstd or zstd (none)\n"
     "  --level <n>              the compression level (1)\n"
     "  --shuffle <n>            blosc's shuffle: 0 none, 1 bytes, 2 bits (1; 0 without blosc)\n"
@@ -154,8 +155,9 @@ std::vector<std::uint64_t> image_axes(const Description &stream)
     return axes;
 }
 
-// One part: a Zarr v3 store holding /images, [frame, ...image], sharded along the frames. The
-// stream indices of its frames go into the array's attributes at the end, as runs.
+// One part: a Zarr v3 store holding /images, an OME-Zarr 0.5 image whose one level, /images/0, is
+// [t, ...image], sharded along the frames. The stream indices of its frames go into the image's
+// attributes at the end, as runs.
 class Part
 {
   public:
@@ -167,11 +169,13 @@ class Part
             throw std::runtime_error(path_.string() + " exists");
         auto [type, element_bytes] = zarr_type(stream.element);
         auto axes = image_axes(stream);
+        if(axes.size() > 3)
+            throw std::invalid_argument("a frame of " + std::to_string(axes.size()) +
+                                        " axes: OME-Zarr images have at most 3 space axes");
         static const char *const k_names[] = {"z", "y", "x"};
-        names_.push_back("frame");
+        names_.push_back("t");
         for(std::size_t i = 0; i < axes.size(); ++i)
-            names_.push_back(axes.size() <= 3 ? k_names[3 - axes.size() + i]
-                                              : "axis_" + std::to_string(i));
+            names_.push_back(k_names[3 - axes.size() + i]);
         dimensions_.push_back({names_[0].c_str(), ZarrDimensionType_Time, 0, chunk_frames,
                                shard_chunks, nullptr, 1.0});
         frame_bytes_ = element_bytes;
@@ -190,7 +194,7 @@ class Part
         array.dimensions = dimensions_.data();
         array.dimension_count = dimensions_.size();
         array.data_type = type;
-        array.is_ngff = false; // a plain array: the stitched store is not OME
+        array.is_ngff = true; // an OME-Zarr image of one level, /images/0
         ZarrStreamSettings settings{};
         settings.store_path = path_.c_str();
         settings.max_threads = o.zarr_threads;
@@ -417,15 +421,8 @@ Json write(const Options &options)
     const std::uint32_t depth = range * options.queue;
     const std::uint32_t chunk =
         options.chunk_frames ? options.chunk_frames : options.frames_per_block;
-    if(range % chunk)
-        throw std::invalid_argument("--chunk-frames " + std::to_string(chunk) +
-                                    " does not divide the range of " + std::to_string(range));
-    const std::uint32_t shard = options.shard_chunks ? options.shard_chunks : range / chunk;
-    if(range % (chunk * shard))
-        throw std::invalid_argument("a shard of " + std::to_string(chunk * shard) +
-                                    " frames does not divide the range of " +
-                                    std::to_string(range) +
-                                    ": the parts could not be stitched into one store");
+    const std::uint32_t shard =
+        options.shard_chunks ? options.shard_chunks : std::max(1u, range / chunk);
 
     auto proxy = bench::connect(options.device, options.wait_seconds);
     SubscriptionOptions subscribe;

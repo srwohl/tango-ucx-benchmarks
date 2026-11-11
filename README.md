@@ -187,7 +187,8 @@ most 60 writers.
 Shards are chunked, with one block per chunk unless `--chunk-frames` is given. They grow as
 frames arrive, because the frames each writer receives are not known in advance. Each writer
 calls `fsync` after closing its shard; `--no-sync` omits that, and so durability, from the
-measurement. Throughput runs from the first frame received to the last write. The report
+measurement. Throughput runs from the first frame received to the last write; "durable" runs
+to the last shard closed and fsynced, which is what `zarr_write.py`'s GB/s measures. The report
 lists each layout's median, best and worst GB/s. It also gives the per-writer rate, overlap
 (time in HDF5 calls over run time), the share of HDF5 time spent waiting for another thread in
 the same process, the minimum and maximum one-second rates, and sync time. `--check` reads the
@@ -211,9 +212,12 @@ pixi run -e zarr python zarr_write.py --output-dir /gpfs/scratch/me --frame-byte
   --frames 4096 --layouts 1x1,1x4,4x1,8x1 --repeats 3 --direct-io --out results/zarr-direct.jsonl
 ```
 
-Each writer thread owns a part, `capture.part_NNN.zarr`: a Zarr v3 store whose `/images` is
-`[frame, ...image]`, sharded along frames. A one-axis frame is stored as `[1, n]`, because
-acquire-zarr needs two image axes. Differences from the HDF5 writer:
+Each writer thread owns a part, `capture.part_NNN.zarr`: a Zarr v3 store whose `/images` is an
+[OME-Zarr (NGFF) 0.5](https://ngff.openmicroscopy.org/0.5/) image. Its one level, `/images/0`,
+holds the frames as `[t, ...image]` with axes `t` (time) and `y, x` or `z, y, x` (space),
+sharded along `t`. A one-axis frame is stored as `[1, n]`, because acquire-zarr needs two image
+axes, and frames of more than three axes are refused, because OME-Zarr images have at most
+three space axes. Scales are 1 and axes have no units. Differences from the HDF5 writer:
 
 - **An append copies and returns.** `ZarrStream_append` copies a block into the stream's queue
   (about 256 MiB) and returns; acquire-zarr's own threads write it. So the credit returns
@@ -226,25 +230,35 @@ acquire-zarr needs two image axes. Differences from the HDF5 writer:
   failed write or flush.
 - **Compression** is `--compression none|blosc-lz4|blosc-zstd|zstd` with `--level` and
   `--shuffle`.
+- **Shard files.** A shard holds `--chunk-frames` x `--shard-chunks` frames, by default one
+  range: with the default range of 8 frames, 1024 frames of 4 MiB are 128 files of 32 MiB, each
+  fsynced. An HDF5 writer makes one file. For a like-for-like comparison, give both drivers the
+  same block, stripe and chunk, and give Zarr `--shard-frames part`, one shard a writer, sized for
+  the most frames a writer can be given. `--shard-frames <n>` sets any whole number of chunks.
 
-After each run the driver makes `capture.zarr`, a native Zarr v3 store of the whole stream that
-zarr-python, tensorstore or any other Zarr v3 reader opens:
+When a shard divides the pull range, the driver makes `capture.zarr` after each run: the whole
+stream as an OME-Zarr image that napari (with napari-ome-zarr), ome-zarr-py, zarr-python,
+tensorstore or any other OME-Zarr or Zarr v3 reader opens:
 
 ```python
 import zarr
-images = zarr.open_array("/gpfs/scratch/me/tango-ucx-zarr-.../capture.zarr/images", mode="r")
+images = zarr.open_array("/gpfs/scratch/me/tango-ucx-zarr-.../capture.zarr/images/0", mode="r")
 ```
 
-Its `images/zarr.json` is the parts' array with the run's frame count. Each shard file is a
+Its `images/zarr.json` holds the parts' OME metadata, and `images/0/zarr.json` is the parts'
+array with the run's frame count. Each shard file is a
 relative symlink to a part's shard file, so nothing is copied. This works because the publisher
-gives each puller whole ranges that start at multiples of the range, and the writer refuses to
-start unless a shard (`--chunk-frames` x `--shard-chunks`, by default the range) divides the
-range. Each part records its frames' runs in `images/zarr.json` under
-`attributes.tango_ucx.frame_runs`. A frame missing or written twice fails the run, and so does a
-range split between pullers, which happens only if a puller leaves mid-run. `--check` reads
-every frame back with zarr-python and with tensorstore and compares it with what was sent. To
-copy a capture elsewhere, follow the links (`cp -rL`, `rsync -L`). Moving the run directory
-as a whole keeps them working.
+gives each puller whole ranges that start at multiples of the range, so each of a part's shards
+is also a shard of the stream. A range split between pullers, which happens only if a puller
+leaves mid-run, fails the run. A larger shard, such as `--shard-frames part`, spans ranges that
+went to different writers, so no `capture.zarr` is made. Each part is still a native Zarr v3
+store, and the driver opens each one with both readers instead. Each part records its frames'
+runs in `images/zarr.json` under `attributes.tango_ucx.frame_runs`, which map a part's frame to
+the stream's, as `/frame_index` does in an HDF5 shard. A frame missing or written twice fails
+the run. Every image, `capture.zarr` or each part, is validated against the OME-Zarr
+specification by ome-zarr-models and opened by ome-zarr. `--check` also reads every frame back
+with zarr-python and with tensorstore and compares it with what was sent. To copy a capture elsewhere, follow the links (`cp -rL`, `rsync -L`).
+Moving the run directory as a whole keeps them working.
 
 `--direct-io` sets `ZARR_DIRECT_IO=1`, which opens shard files with `O_DIRECT`. acquire-zarr
 writes one `pwrite` per chunk, then a small index at the end of each shard file, so only the

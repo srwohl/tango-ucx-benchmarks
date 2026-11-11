@@ -392,6 +392,7 @@ void write_frames(Writer &writer, const Options &options)
         if(failure.empty())
             failure = error.what();
     }
+    const auto closed = unix_ns(); // closed, and durable unless --no-sync
     Json tenths = Json::object();
     for(const auto &[tenth, bytes] : bytes_by_tenth)
         tenths[std::to_string(tenth)] = bytes;
@@ -403,6 +404,7 @@ void write_frames(Writer &writer, const Options &options)
                      {"partial_batches", partial},
                      {"first_receive_unix_ns", first_receive},
                      {"last_write_unix_ns", last_write},
+                     {"closed_unix_ns", closed},
                      {"write_seconds", double(hdf5.held_ns) / 1e9},
                      {"hdf5_wait_seconds", double(hdf5.waited_ns) / 1e9},
                      {"close_seconds", double(closing.held_ns) / 1e9},

@@ -286,18 +286,20 @@ def write_section(label, meta):
              "",
              "A layout is processes x threads on each host; every thread writes its own shard. "
              "GB/s is all the bytes over the time from the first frame received to the last write, "
-             "the median of the runs with best and worst. \"Overlap\" is the writers' time in "
+             "the median of the runs with best and worst. \"Durable\" runs instead to the last "
+             "shard closed and fsynced, the time Zarr's GB/s runs to. \"Overlap\" is the writers' time in "
              "HDF5 calls over that time: above 1, calls ran at once. \"Waiting\" is the share of "
              "a writer's HDF5 time spent waiting for another thread of its process to leave the "
              "library. One-second rates are of the median run.", ""]
     header = ["Hosts", "Layout", "Writers", "Block", "Stripe", "Queue", "GB/s", "best", "worst",
-              "per writer", "overlap", "waiting", "1 s min", "1 s max", "sync s", "runs"]
+              "durable", "per writer", "overlap", "waiting", "1 s min", "1 s max", "sync s",
+              "runs"]
     rows = []
     for (hosts, processes, threads, block, stripe, depth), group in groups.items():
         good = [run for run in group if run.get("ok")]
         if not good:
             rows.append([hosts, f"{processes}x{threads}", group[0]["writers"], block, stripe,
-                         depth] + [""] * 9 + [f"0 of {len(group)}: {group[0].get('failure', '')}"])
+                         depth] + [""] * 10 + [f"0 of {len(group)}: {group[0].get('failure', '')}"])
             continue
         rates = sorted(run["GB_per_second"] for run in good)
         median = statistics.median(rates)
@@ -309,6 +311,7 @@ def write_section(label, meta):
             return "" if value is None else f"{value:.2f}"
         rows.append([hosts, f"{processes}x{threads}", middle["writers"], block, stripe, depth,
                      gb(median), gb(rates[-1]), gb(rates[0]),
+                     gb(middle.get("durable_GB_per_second")),
                      gb(statistics.mean(each) * (1 << 20) / 1e9) if each else "",
                      f"{middle['write_concurrency']:.2f}", f"{middle['hdf5_wait_share']:.0%}",
                      gb(steady.get("GB_per_second_min")), gb(steady.get("GB_per_second_max")),

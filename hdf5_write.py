@@ -263,6 +263,9 @@ def run_once(args, publisher, processes, threads, run_name, repeat, logs):
     ends = [w["last_write_unix_ns"] for w in writers if w["last_write_unix_ns"]]
     total = sum(writer["bytes"] for writer in writers)
     seconds = (max(ends) - min(starts)) / 1e9 if starts and ends else 0
+    # To the last shard closed and fsynced: the time zarr_write.py's GB/s runs to.
+    closed = [w["closed_unix_ns"] for w in writers if w.get("closed_unix_ns")]
+    durable = (max(closed) - min(starts)) / 1e9 if starts and closed else 0
     write_seconds = sum(writer["write_seconds"] for writer in writers)
     waits = sum(writer["hdf5_wait_seconds"] for writer in writers)
     per_writer = [w["bytes"] / ((w["last_write_unix_ns"] - w["first_receive_unix_ns"]) / 1e9)
@@ -272,6 +275,7 @@ def run_once(args, publisher, processes, threads, run_name, repeat, logs):
         bytes=total, seconds=seconds, wall_seconds=wall,
         GB_per_second=total / seconds / 1e9 if seconds else 0,
         MiB_per_second=total / seconds / (1 << 20) if seconds else 0,
+        durable_GB_per_second=total / durable / 1e9 if durable else 0,
         write_concurrency=write_seconds / seconds if seconds else 0,
         hdf5_wait_share=waits / (waits + write_seconds) if waits + write_seconds else 0,
         per_writer_MiB_per_second=per_writer,
@@ -341,7 +345,7 @@ def sweep(args):
     remote = not all(is_local(h) for h in args.hosts)
     address = args.publisher_address or (socket.getfqdn() if remote else "127.0.0.1")
     failed = 0
-    print(f"{'layout':>8} {'hosts':>5} {'writers':>7} {'GB/s':>7} {'per writer':>10} "
+    print(f"{'layout':>8} {'hosts':>5} {'writers':>7} {'GB/s':>7} {'durable':>7} {'per writer':>10} "
           f"{'H5Dwrite':>8} {'waiting':>7} {'1 s min':>7} {'1 s max':>7} {'sync s':>7}  result")
     with Publisher(args.build, address=address) as publisher:
         for number, (processes, threads, repeat) in enumerate(plan):
@@ -359,7 +363,8 @@ def sweep(args):
             def gb(value):
                 return f"{value:7.2f}" if isinstance(value, (int, float)) else f"{'':>7}"
             print(f"{f'{processes}x{threads}':>8} {len(args.hosts):>5} {record['writers']:>7} "
-                  f"{gb(record.get('GB_per_second'))} {mean * 1.073741824:>10.2f} "
+                  f"{gb(record.get('GB_per_second'))} {gb(record.get('durable_GB_per_second'))} "
+                  f"{mean * 1.073741824:>10.2f} "
                   f"{gb(record.get('write_concurrency'))} "
                   f"{record.get('hdf5_wait_share', 0):>7.0%} "
                   f"{gb(steady.get('GB_per_second_min'))} {gb(steady.get('GB_per_second_max'))} "
