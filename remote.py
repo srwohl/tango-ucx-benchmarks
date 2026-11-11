@@ -10,6 +10,7 @@ is an OpenSSH control master. Commands then go through it with BatchMode, so a l
 fails the command rather than logging in again.
 
     remote.py check --hosts node1,node2              log in to each and print its name
+    remote.py on --hosts node1,node2 -- 'df -h /tmp'  run a shell command on each, in turn
     remote.py run --hosts node1,node2 -- CMD ARGS    run CMD here with those logins open;
                                                      CMD reaches the hosts with "$REMOTE_SSH"
 """
@@ -32,6 +33,13 @@ PASSWORD_SOCKET = 'REMOTE_PASSWORD_SOCKET'
 SESSIONS_PER_LOGIN = 10
 # A login left behind by a killed run ends after this long unused.
 LOGIN_IDLE_LIMIT = '30m'
+# What a host without a home directory says at every login: no news.
+NOISE = 'Could not chdir to home directory'
+
+
+def meaningful(text):
+    """The lines of what a host said, without the noise of its logins."""
+    return [line for line in text.splitlines() if line.strip() and NOISE not in line]
 
 
 def askpass(prompt):
@@ -232,7 +240,10 @@ def main(argv=None):
     run = commands.add_parser('run', help='run a command here while the logins are open')
     run.add_argument('command', nargs=argparse.REMAINDER,
                      help='after --: the command, which reaches hosts with "$REMOTE_SSH" HOST')
-    for sub in (check, run):
+    on = commands.add_parser('on', help='run a shell command on each host and show what it says')
+    on.add_argument('command', nargs=argparse.REMAINDER,
+                    help='after --: the shell command, one line run by the login shell there')
+    for sub in (check, run, on):
         sub.add_argument('--hosts', required=True, help='hosts, with commas between')
         add_arguments(sub)
     args = parser.parse_args(argv)
@@ -242,8 +253,8 @@ def main(argv=None):
     command = list(getattr(args, 'command', []))
     if command[:1] == ['--']:
         command = command[1:]
-    if args.what == 'run' and not command:
-        parser.error('run needs a command after --')
+    if args.what in ('run', 'on') and not command:
+        parser.error(f'{args.what} needs a command after --')
     try:
         with Session.from_args(args, hosts={host: 1 for host in hosts}) as session:
             if args.what == 'check':
@@ -255,6 +266,17 @@ def main(argv=None):
                     print(f"{session.target(host)}: {'ok' if done.returncode == 0 else 'FAILED'}"
                           f" ({name})")
                     failed += done.returncode != 0
+                return 1 if failed else 0
+            if args.what == 'on':
+                failed = 0
+                for host in hosts:
+                    done = subprocess.run(session.argv(host, ' '.join(command)), text=True,
+                                          capture_output=True, stdin=subprocess.DEVNULL)
+                    for line in meaningful(done.stdout + done.stderr):
+                        print(f'{session.target(host)}: {line}')
+                    if done.returncode:
+                        print(f'{session.target(host)}: exit {done.returncode}')
+                        failed += 1
                 return 1 if failed else 0
             env = dict(os.environ, REMOTE_SSH=str(session.wrapper()))
             return subprocess.run(command, env=env).returncode

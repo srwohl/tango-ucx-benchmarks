@@ -36,7 +36,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from bench import Publisher, describe_host, size  # noqa: E402
-import remote  # noqa: E402
+import remote as remote_login  # noqa: E402
 
 
 def layouts(text):
@@ -352,7 +352,7 @@ def sweep(args):
           f"{'H5Dwrite':>8} {'waiting':>7} {'1 s min':>7} {'1 s max':>7} {'sync s':>7}  result")
     # One login to each other host for the sweep, enough for its largest layout.
     logins = {h: max(p for p, _ in args.layouts) for h in args.hosts if not is_local(h)}
-    with remote.Session.from_args(args, logins) as session, \
+    with remote_login.Session.from_args(args, logins) as session, \
             Publisher(args.build, address=address) as publisher:
         for number, (processes, threads, repeat) in enumerate(plan):
             if publisher.process.poll() is not None:
@@ -448,7 +448,7 @@ def main():
     parser.add_argument("--out", help="a new file for the run records, one JSON line each")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
-    remote.add_arguments(parser)
+    remote_login.add_arguments(parser)
     args = parser.parse_args()
     args.build = args.build.resolve()
     if args.self_test:

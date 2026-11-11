@@ -684,6 +684,15 @@ class Side:
                                 stdin=subprocess.PIPE, stdout=log or subprocess.DEVNULL,
                                 stderr=subprocess.STDOUT)
 
+    def free_port(self):
+        """A port free on this side's host now, from the system's own choice."""
+        if self.host is None:
+            return free_port()
+        done = self.run([self.python, "-c", "import socket; s = socket.socket(); "
+                         "s.bind(('', 0)); print(s.getsockname()[1])"], slot=1, timeout=60)
+        found = [line for line in meaningful(done.stdout) if line.strip().isdigit()]
+        return int(found[-1]) if found else random.randint(20000, 59999)
+
     def answers(self, address, port, seconds=30):
         done = self.run([self.python, "-c", ANSWERS, address, port, int(seconds * 10)],
                         slot=1, timeout=seconds + 60)
@@ -697,7 +706,7 @@ class Side:
         done = self.run([self.python, "bench.py", "describe"], timeout=120)
         lines = [line for line in done.stdout.splitlines() if line.startswith("{")]
         if done.returncode or not lines:
-            said = (done.stderr.strip() or done.stdout.strip()).splitlines()
+            said = meaningful(done.stderr) or meaningful(done.stdout)
             raise SystemExit(f"bench: {self.host} has no deployment at {self.root} that "
                              "answers: " + (said[-1] if said else "no answer"))
         return json.loads(lines[-1])
@@ -746,7 +755,7 @@ class RemotePublisher:
             stop(self.process)
             self.log.close()
         raise RuntimeError(f"the publisher did not start on {self.address}: "
-                           + (said.strip().splitlines() or ["no output"])[-1])
+                           + (meaningful(said) or ["no output"])[-1])
 
     def said(self):
         self.log.seek(0)
@@ -760,18 +769,32 @@ class RemotePublisher:
         self.log.close()
 
 
-def run_remote_reference(name, frame_bytes, args, cpus, peer, subscriber, settings):
+meaningful = remote_login.meaningful
+
+
+def run_remote_reference(name, frame_bytes, args, cpus, peer, subscriber, settings, tries=2):
     """ucx_perftest from the peer to the subscriber's host: the client there sends, as
-    tango-ucx's publisher does; the server receives, on the subscriber loop's CPU."""
+    tango-ucx's publisher does; the server receives, on the subscriber loop's CPU. A run that
+    fails is tried once more, on another port, and the attempts are recorded."""
+    for attempt in range(1, tries + 1):
+        point = reference_once(name, frame_bytes, args, cpus, peer, subscriber, settings)
+        point["attempts"] = attempt
+        if point["ok"]:
+            break
+    return point
+
+
+def reference_once(name, frame_bytes, args, cpus, peer, subscriber, settings):
     flags, extra = REFERENCES[name]
     frames = frames_for(frame_bytes, args)
-    port = random.randint(20000, 59999)
+    port = subscriber.free_port()
     common = ["-t", "ucp_am_bw", "-s", str(frame_bytes), "-n", str(frames),
               "-w", str(max(10, frames // 10)), "-p", str(port)] + flags
     point = {"program": name, "ok": False, "frame_bytes": frame_bytes, "frames": frames,
              "command": " ".join(["ucx_perftest", subscriber.name, *common]), "settings": extra}
+    log = tempfile.TemporaryFile(mode="w+")
     server = subscriber.start([subscriber.perftest, *common], {**settings, **extra}, slot=1,
-                              cpu=cpus[2] if cpus else None)
+                              cpu=cpus[2] if cpus else None, log=log)
     try:
         # The server listens a moment after it starts: the client's side is tried again.
         for _ in range(50):
@@ -785,13 +808,34 @@ def run_remote_reference(name, frame_bytes, args, cpus, peer, subscriber, settin
             if final or server.poll() is not None:
                 break
         if not final:
-            return {**point, "failure": said.strip().splitlines()[-1:] or "no result"}
+            stop(server, 10)
+            log.seek(0)
+            client = meaningful(done.stdout) or meaningful(done.stderr)
+            there = meaningful(log.read())
+            why = client[-1] if client else f"the client said nothing, exit {done.returncode}"
+            if there:
+                why += f"; the server said: {there[-1]}"
+            return {**point, "failure": why}
         rate = float(final[-1][6])
         return {**point, "ok": True, "frames_per_second": float(final[-1][8]),
                 "MiB_per_second": rate, "Gb_per_second": rate * (1 << 20) * 8 / 1e9,
                 "protocol": protocols(said, frame_bytes)}
     finally:
         stop(server, 10)
+        log.close()
+
+
+def update_hosts(args):
+    """bench.py update: each host's deployed benchmarks brought to this checkout's commit."""
+    hosts = [host.strip() for host in args.hosts.split(",") if host.strip()]
+    try:
+        with remote_login.Session.from_args(args, {host: 1 for host in hosts}) as session:
+            for host in hosts:
+                update(Side(session, host, deployment(session, host, args.remote_root)))
+    except RuntimeError as error:  # a login that failed
+        print(f"bench: {error}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def describe():
@@ -802,7 +846,67 @@ def describe():
     return 0
 
 
+def update(side):
+    """Bring the benchmarks deployed on side to this checkout's commit, through the login: a git
+    bundle of HEAD, so what is not committed here stays behind. They are built again there only
+    when the commit changes what is built."""
+    here = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    if subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
+                      capture_output=True, text=True).stdout.strip():
+        print("bench: this checkout has changes that are not committed; they stay behind",
+              file=sys.stderr)
+    root = shlex.quote(str(side.root))
+    line = (f"cd {root} && old=$(git rev-parse HEAD) && cat > .bench-update.bundle && "
+            "git fetch -q .bench-update.bundle HEAD && git merge -q --ff-only FETCH_HEAD; "
+            "s=$?; rm -f .bench-update.bundle; [ $s -eq 0 ] || exit $s; "
+            'if git diff --quiet "$old" HEAD -- src CMakeLists.txt pixi.toml pixi.lock; '
+            "then echo 'nothing to build'; "
+            "else . ../deploy.env && pixi run -q build >/dev/null && echo 'built again'; fi")
+    with tempfile.TemporaryDirectory() as scratch:
+        bundle = Path(scratch) / "update.bundle"
+        subprocess.run(["git", "-C", str(ROOT), "bundle", "create", "-q", str(bundle), "HEAD"],
+                       check=True)
+        with open(bundle, "rb") as source:
+            done = subprocess.run(side.session.argv(side.host, line), stdin=source, text=True,
+                                  capture_output=True, timeout=1800)
+    said = meaningful(done.stdout + done.stderr)
+    if done.returncode:
+        raise SystemExit(f"bench: {side.name} could not be brought to {here}: "
+                         + (said[-1] if said else f"exit {done.returncode}"))
+    print(f"# {side.name}: tango-ucx-benchmarks at {here}, {said[-1] if said else 'updated'}")
+
+
+def allocate(side, args, nodes):
+    """An exclusive allocation of the nodes, asked for on side; its job id. It is given up if
+    the nodes are not free within two minutes."""
+    nodes = list(dict.fromkeys(nodes))  # one host as both roles is one node
+    line = shlex.join(["salloc", "--no-shell", "--exclusive", "--immediate=120",
+                       "-J", "tango-ucx-bench", "-p", args.allocate, "-t", args.allocate_time,
+                       "-w", ",".join(nodes)])
+    done = subprocess.run(side.session.argv(side.host, line), text=True,
+                          stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+    said = done.stdout + done.stderr
+    granted = re.search(r"Granted job allocation (\d+)", said)
+    if not granted:
+        lines = meaningful(said)
+        raise SystemExit("bench: no allocation of " + ",".join(nodes) + ": "
+                         + (lines[-1] if lines else f"exit {done.returncode}"))
+    print(f"# job {granted[1]}: {','.join(nodes)} in {args.allocate}, exclusive, "
+          f"for at most {args.allocate_time}")
+    return granted[1]
+
+
+def release(side, job):
+    subprocess.run(side.session.argv(side.host, shlex.join(["scancel", job])),
+                   stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    print(f"# job {job} released")
+
+
 def remote(args):
+    # One sweep a file: its report reads every line of it. Said before any login or allocation.
+    if args.out and not args.dry_run and Path(args.out).exists():
+        raise SystemExit(f"bench: {args.out} exists: a remote sweep's results go to a new file")
     hosts = {args.peer: 2}
     if args.subscriber:
         hosts[args.subscriber] = 2
@@ -813,78 +917,110 @@ def remote(args):
                       if args.subscriber else Side(session, None, None))
         if args.address:
             subscriber.name = args.address
-        host = subscriber.describe()
-        other = peer.describe()
-        # The subscriber's host is the host of the sweep; what ran it and how is recorded too.
-        host.update(tier=args.tier, options=" ".join(sys.argv[1:]),
-                    settings=" ".join(words(forwarded())) or "none", peer=other,
-                    controller=socket.gethostname().split(".")[0],
-                    controller_benchmarks=revision(ROOT))
-        print_host(host)
-        print(f"# publisher on {other['host']}: {other['cpu']}, tango-ucx {other['tango_ucx']}  "
-              f"tango-ucx-benchmarks {other['benchmarks']}")
-        if args.subscriber:
-            print(f"# run from {host['controller']}, tango-ucx-benchmarks "
-                  f"{host['controller_benchmarks']}")
-        for key in ("tango_ucx", "benchmarks"):
-            if other[key] != host[key]:
-                print(f"bench: {key} differs: {other[key]} on {other['host']}, {host[key]} on "
-                      f"{host['host']}", file=sys.stderr)
-        args.memory_available = min(filter(None, (host.get("memory_available"),
-                                                  other.get("memory_available"))), default=None)
-        plan = []
-        for name in args.placement:
-            there, why_there = side_cpus(name, other["l3_caches"])
-            here, why_here = side_cpus(name, host["l3_caches"])
-            why = (f"on {other['host']}: {why_there}" if why_there else
-                   f"on {host['host']}: {why_here}" if why_here else None)
-            cpus = there + here if there and here else None
-            line = placement_line(name, cpus, why, other["host"])
-            if args.subscriber:
-                line = line.replace(" here ", f" on {host['host']} ")
-            plan.append((name, cpus, why, line))
-        if args.dry_run:
-            points = runs = 0
-            for transport, settings in args.transports:
-                print(f"# transport {transport}: {' '.join(words(settings)) or 'UCX defaults'}")
-                more = dry_run(args, plan)
-                points, runs = points + more[0], runs + more[1]
-            print(f"# {points} points, {runs} runs")
-            return 0
-        out = open_out(args, host)
-        failed = 0
-        print(TABLE_HEAD)
-        for transport, settings in args.transports:
-            both = {**forwarded(), **settings}
-            print(f"# transport {transport}: {' '.join(words(settings)) or 'UCX defaults'}")
-            try:
-                publisher = RemotePublisher(peer, subscriber, both)
-            except RuntimeError as error:
-                print(f"# transport {transport}: FAILED: {error}")
-                if out:
-                    out.write(json.dumps({"transport": transport, "skipped": str(error)}) + "\n")
-                failed += 1
-                continue
-            with publisher:
-                def point_of(program, frame_bytes, depth, cpus):
-                    if depth is None:
-                        return run_remote_reference(program, frame_bytes, args, cpus, peer,
-                                                    subscriber, both)
-                    build = (Path(args.build).resolve() if subscriber.host is None
-                             else subscriber.root / "build")
-                    point = run_point(build, publisher.device, frame_bytes,
-                                      depth, args, cpus=cpus,
-                                      runner=lambda command: subscriber.run(command, both))
-                    point["program"] = program
-                    return point
+        job = None
+        try:
+            if not args.dry_run:
+                if args.update:
+                    for side in (peer, subscriber):
+                        if side.host:
+                            update(side)
+                if args.allocate:
+                    job = allocate(peer, args, [peer.name, subscriber.name])
+            status = measure_remote(args, peer, subscriber)
+        finally:
+            if job:
+                release(peer, job)
+    if args.out and not args.dry_run:
+        md = str(Path(args.out).with_suffix(".md"))
+        subprocess.run([sys.executable, str(ROOT / "report.py"), args.out, "--out", md])
+    return status
 
-                done = measure(args, out, publisher, plan, point_of,
-                               tag={"transport": transport, "transport_settings": settings,
-                                    "publisher_host": other["host"],
-                                    "subscriber_host": host["host"]})
-            if done is None:
-                return 1
-            failed += done
+
+def one_host(args):
+    """Whether the peer is the subscriber's host too: a one-host sweep run from elsewhere."""
+    name = lambda host: host.rsplit("@", 1)[-1] if host else None
+    return bool(args.subscriber) and name(args.peer) == name(args.subscriber)
+
+
+def measure_remote(args, peer, subscriber):
+    host = subscriber.describe()
+    other = peer.describe()
+    # The subscriber's host is the host of the sweep; what ran it and how is recorded too.
+    host.update(tier=args.tier, options=" ".join(sys.argv[1:]),
+                settings=" ".join(words(forwarded())) or "none", peer=other,
+                controller=socket.gethostname().split(".")[0],
+                controller_benchmarks=revision(ROOT))
+    print_host(host)
+    print(f"# publisher on {other['host']}: {other['cpu']}, tango-ucx {other['tango_ucx']}  "
+          f"tango-ucx-benchmarks {other['benchmarks']}")
+    if args.subscriber:
+        print(f"# run from {host['controller']}, tango-ucx-benchmarks "
+              f"{host['controller_benchmarks']}")
+    for key in ("tango_ucx", "benchmarks"):
+        if other[key] != host[key]:
+            print(f"bench: {key} differs: {other[key]} on {other['host']}, {host[key]} on "
+                  f"{host['host']}", file=sys.stderr)
+    args.memory_available = min(filter(None, (host.get("memory_available"),
+                                              other.get("memory_available"))), default=None)
+    plan = []
+    for name in args.placement:
+        if one_host(args):
+            # Both roles on one host, as bench.py local places them, run from elsewhere.
+            cpus, why = placement_cpus(name, host["l3_caches"])
+            line = placement_line(name, cpus, why) + ("" if why else f", on {host['host']}")
+            plan.append((name, cpus, why, line))
+            continue
+        there, why_there = side_cpus(name, other["l3_caches"])
+        here, why_here = side_cpus(name, host["l3_caches"])
+        why = (f"on {other['host']}: {why_there}" if why_there else
+               f"on {host['host']}: {why_here}" if why_here else None)
+        cpus = there + here if there and here else None
+        line = placement_line(name, cpus, why, other["host"])
+        if args.subscriber:
+            line = line.replace(" here ", f" on {host['host']} ")
+        plan.append((name, cpus, why, line))
+    if args.dry_run:
+        points = runs = 0
+        for transport, settings in args.transports:
+            print(f"# transport {transport}: {' '.join(words(settings)) or 'UCX defaults'}")
+            more = dry_run(args, plan)
+            points, runs = points + more[0], runs + more[1]
+        print(f"# {points} points, {runs} runs")
+        return 0
+    out = open_out(args, host)
+    failed = 0
+    print(TABLE_HEAD)
+    for transport, settings in args.transports:
+        both = {**forwarded(), **settings}
+        print(f"# transport {transport}: {' '.join(words(settings)) or 'UCX defaults'}")
+        try:
+            publisher = RemotePublisher(peer, subscriber, both)
+        except RuntimeError as error:
+            print(f"# transport {transport}: FAILED: {error}")
+            if out:
+                out.write(json.dumps({"transport": transport, "skipped": str(error)}) + "\n")
+            failed += 1
+            continue
+        with publisher:
+            def point_of(program, frame_bytes, depth, cpus):
+                if depth is None:
+                    return run_remote_reference(program, frame_bytes, args, cpus, peer,
+                                                subscriber, both)
+                build = (Path(args.build).resolve() if subscriber.host is None
+                         else subscriber.root / "build")
+                point = run_point(build, publisher.device, frame_bytes,
+                                  depth, args, cpus=cpus,
+                                  runner=lambda command: subscriber.run(command, both))
+                point["program"] = program
+                return point
+
+            done = measure(args, out, publisher, plan, point_of,
+                           tag={"transport": transport, "transport_settings": settings,
+                                "publisher_host": other["host"],
+                                "subscriber_host": host["host"]})
+        if done is None:
+            return 1
+        failed += done
     return 1 if failed else 0
 
 
@@ -923,6 +1059,7 @@ def sweep_options(parser):
 
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)  # in order with what subprocesses print
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     roles = parser.add_subparsers(dest="where", required=True)
@@ -943,20 +1080,37 @@ def main():
     two.add_argument("--peer", required=True, help="the publisher's host, as ssh reaches it")
     two.add_argument("--subscriber", help="the subscriber's host, as ssh reaches it; this host "
                                           "then only runs the sweep (without it, the "
-                                          "subscriber runs here)")
+                                          "subscriber runs here). The peer's name again: "
+                                          "both roles on that host, as local runs them")
     two.add_argument("--remote-root",
                      help="the deployed benchmarks on the other hosts "
                           "(/tmp/USER/tango-ucx/tango-ucx-benchmarks, as deploy.sh puts them)")
     two.add_argument("--address", help="the subscriber's name as the peer reaches it "
                                        "(its short name)")
+    two.add_argument("--update", action="store_true",
+                     help="first bring the other hosts' deployed benchmarks to this checkout's "
+                          "commit, and build them again if it changes what is built")
+    two.add_argument("--allocate", metavar="PARTITION",
+                     help="first allocate both hosts in this SLURM partition, exclusively, and "
+                          "release them at the end")
+    two.add_argument("--allocate-time", default="1:00:00",
+                     help="the allocation's time limit (1:00:00)")
     two.add_argument("--transports", type=transports, default=transports("default"),
                      help="default, rdma:DEVICES, tcp:INTERFACE, with commas between (default)")
     remote_login.add_arguments(two, batch_flag='--ssh-batch')
     two.set_defaults(run=remote, rate=0, hdf5=None, hdf5_dataset=None, read_ahead=0)
     roles.add_parser("describe", help="this host as JSON, for a remote sweep run elsewhere")
+    three = roles.add_parser("update", help="bring other hosts' deployed benchmarks to this "
+                                            "checkout's commit, and build them again if needed")
+    three.add_argument("--hosts", required=True, help="hosts, with commas between")
+    three.add_argument("--remote-root", help="the deployed benchmarks there "
+                                             "(/tmp/USER/tango-ucx/tango-ucx-benchmarks)")
+    remote_login.add_arguments(three, batch_flag="--ssh-batch")
     args = parser.parse_args()
     if args.where == "describe":
         return describe()
+    if args.where == "update":
+        return update_hosts(args)
     placement_given = args.placement is not None
     usual = dict(sizes="4K,64K,1M,8M", depth=[32], runs=3, bytes="2G", reference=False,
                  placement=["unpinned"])
@@ -966,8 +1120,9 @@ def main():
         if getattr(args, name) is None:
             setattr(args, name, {"sizes": sizes, "bytes": size}.get(name, lambda v: v)(value))
     if args.where == "remote" and not placement_given:
-        # Spread across one host's caches says little of a network; pinned and not is the point.
-        args.placement = ["unpinned", "one-l3"]
+        # Between hosts, spread across one host's caches says little of the network: pinned and
+        # not is the point. On one host, all three, as local.
+        args.placement = list(PLACEMENTS) if one_host(args) else ["unpinned", "one-l3"]
     if not 0 <= args.rate <= 1_000_000_000:
         parser.error('--rate must be between zero and one billion frames/s')
     if args.rate and args.reference:
