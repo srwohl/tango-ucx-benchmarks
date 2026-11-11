@@ -4,6 +4,7 @@
 // tango_ucx_perftest: the subscriber's side of the suite. It tells a tango_ucx_perf_publisher
 // what to publish, receives it through an every subscription, and reports the rate.
 #include "common.h"
+#include "control.h"
 #include "memory.h"
 
 #include <tango-ucx/tango.h>
@@ -28,6 +29,8 @@ namespace
 {
 using namespace TangoUcx;
 using namespace std::chrono_literals;
+using bench::budget_for;
+using bench::command;
 using bench::Json;
 
 const char *const k_usage =
@@ -36,6 +39,12 @@ const char *const k_usage =
     "  <device>            the publisher, as host:port/bench/ucx/1#dbase=no\n"
     "  -t bw               the test: bandwidth of every frame, in order (the only one so far)\n"
     "  -s <bytes>          frame size; K, M and G are powers of 1024 (1M)\n"
+    "  --hdf5 <file>       publish the frames of an HDF5 image stack, as the publisher's host\n"
+    "                      names the file; the frame size is the dataset's\n"
+    "  --hdf5-dataset <p>  the dataset, when the file has no NeXus default/signal chain\n"
+    "  --describe          with --hdf5: print what the publisher finds in the file, and stop\n"
+    "  --read-ahead <n>    with --hdf5: frames a reader thread reads before they are published,\n"
+    "                      in source slots beyond the depth; 0 reads each one as it is sent (8)\n"
     "  -n <frames>         frames to measure (1000)\n"
     "  -w <frames>         frames before the clock starts (a tenth of -n; at least both rings "
     "twice)\n"
@@ -44,18 +53,19 @@ const char *const k_usage =
     "  --rate <frames/s>   pace the publisher; latency uses the same host's steady clock\n"
     "  --memory host|cuda  payload rings at both ends (host)\n"
     "  --thread-cpus p,g,s,r publisher loop, generator, subscriber loop, reader CPUs\n"
-    "  --verify            fill every frame and check every byte; costs bandwidth\n"
+    "  --verify            fill every frame and check every byte; costs bandwidth. HDF5\n"
+    "                      frames carry a checksum the publisher computes after reading\n"
     "  --corrupt-every <n> with --verify: damage every nth frame, and expect to find them\n"
     "  --wait <seconds>    how long to wait for the device to answer (30)\n"
     "  --json              one JSON line instead of the table\n";
 
 struct Options
 {
-    std::string device, test = "bw", memory = "host";
+    std::string device, test = "bw", memory = "host", hdf5_file, hdf5_dataset;
     std::uint64_t frame_bytes = 1 << 20, frames = 1000, corrupt_every = 0, rate = 0;
     std::optional<std::uint64_t> warmup;
-    std::uint32_t depth = 32, batch = 1;
-    bool verify = false, json = false;
+    std::uint32_t depth = 32, batch = 1, read_ahead = 8;
+    bool verify = false, json = false, describe = false, size_given = false;
     double wait_seconds = 30;
     std::array<int, 4> cpus{-1, -1, -1, -1};
 };
@@ -106,81 +116,52 @@ Json software()
             {"compiler", __VERSION__}};
 }
 
-// The device answers once its server has started; until then the proxy or its first call throws.
-Tango::DeviceProxy connect(const Options &options)
+Json hdf5_of(const Options &options)
 {
-    auto until = bench::now_ns() + std::int64_t(options.wait_seconds * 1e9);
-    for(;;)
-    {
-        try
-        {
-            Tango::DeviceProxy proxy(options.device);
-            proxy.ping();
-            proxy.set_timeout_millis(30'000); // Configure registers the whole source
-            return proxy;
-        }
-        catch(const Tango::DevFailed &)
-        {
-            if(bench::now_ns() >= until)
-                throw std::runtime_error("no answer from " + options.device);
-        }
-        std::this_thread::sleep_for(50ms);
-    }
-}
-// A command of the publisher that answers with a JSON document.
-Json command(Tango::DeviceProxy &proxy, const char *name, const Json *document = nullptr)
-{
-    Tango::DeviceData reply;
-    if(document)
-    {
-        Tango::DeviceData in;
-        in << document->dump();
-        reply = proxy.command_inout(name, in);
-    }
-    else
-        reply = proxy.command_inout(name);
-    std::string text;
-    reply >> text;
-    return Json::parse(text);
+    Json hdf5{{"file", options.hdf5_file}};
+    if(!options.hdf5_dataset.empty())
+        hdf5["dataset"] = options.hdf5_dataset;
+    return {{"hdf5", hdf5}};
 }
 
-// The library derives a ring's depth from a budget and does not take a depth. This finds the
-// budget of a depth. A deeper ring never costs less, so once one budget is known to be too small
-// and one too large, the budget wanted is between them. `depth_of` makes the ring of a budget and
-// says how deep it is, or 0 when the budget was refused.
-std::uint64_t budget_for(std::uint32_t want, std::uint64_t frame_bytes,
-                         const std::function<std::uint32_t(std::uint64_t)> &depth_of,
-                         std::uint32_t &got)
+// What the publisher finds in the file, before a run sizes its rings by it.
+Json describe(const Options &options)
 {
-    const std::uint64_t slot = frame_bytes + 1536; // a guess at what a slot costs
-    std::uint64_t budget = (256u << 10) + want * slot, small = 0, large = 0;
-    for(int tries = 0; tries < 48; ++tries)
-    {
-        got = depth_of(budget);
-        if(got == want)
-            return budget;
-        (got < want ? small : large) = budget;
-        if(small && large)
-        {
-            if(large - small < 2)
-                break; // no budget gives this depth: the library rounds a depth down
-            budget = small + (large - small) / 2;
-        }
-        else if(got < want)
-            budget += (want - got) * slot;
-        else
-            budget = std::max<std::uint64_t>(1, budget / 2);
-    }
-    if(!got && large)
-        got = depth_of(budget = large); // the least ring that was made
-    return budget;
+    auto proxy = bench::connect(options.device, options.wait_seconds);
+    auto wanted = hdf5_of(options);
+    return command(proxy, "Describe", &wanted);
 }
 
-Json bandwidth(const Options &options)
+// A frame read from a file is checked against the checksum in its record, and against the
+// frame of the dataset that the publisher reads for its index: the file's frames in order, again
+// and again.
+std::uint64_t mismatched_files(const Batch &batch, std::size_t record_stride,
+                               std::uint64_t file_frames)
+{
+    std::uint64_t mismatched = 0;
+    const auto *records = static_cast<const std::byte *>(batch.records());
+    for(std::size_t i = 0; i < batch.frames(); ++i)
+    {
+        bench::FileFields fields;
+        std::memcpy(&fields, records + i * record_stride + 16, sizeof(fields));
+        mismatched += bench::checksum(batch.payload(i)) != fields.checksum ||
+                      fields.source_frame != batch.index(i) % file_frames;
+    }
+    return mismatched;
+}
+
+Json bandwidth(Options options)
 {
     bool gpu = options.memory == "cuda";
     bench::Memory memory(gpu);
-    auto proxy = connect(options);
+    auto proxy = bench::connect(options.device, options.wait_seconds);
+    Json source = {{"kind", "generated"}};
+    if(!options.hdf5_file.empty())
+    {
+        auto wanted = hdf5_of(options);
+        source = command(proxy, "Describe", &wanted);
+        options.frame_bytes = source.at("frame_bytes").get<std::uint64_t>();
+    }
     // Before the clock starts every slot of both rings is used twice: the first use of a page
     // faults it in, and the publisher fills each of its slots once.
     auto deepest = std::max<std::uint64_t>(options.depth, 3);
@@ -196,10 +177,17 @@ Json bandwidth(const Options &options)
                 {"publisher_cpu", options.cpus[0]},
                 {"producer_cpu", options.cpus[1]},
                 {"memory", options.memory}};
+    // Frames read ahead wait in source slots of their own: the depth is what remains for sending.
+    std::uint32_t read_ahead = 0;
+    if(!options.hdf5_file.empty())
+    {
+        wanted.update(hdf5_of(options));
+        wanted["read_ahead"] = read_ahead = options.read_ahead;
+    }
     std::uint32_t slots = 0, depth = 0;
     std::string refused; // why the last budget was
     auto publisher_budget = budget_for(
-        std::max<std::uint32_t>(options.depth, 3), options.frame_bytes,
+        std::max<std::uint32_t>(options.depth, 3) + read_ahead, options.frame_bytes,
         [&](std::uint64_t budget)
         {
             wanted["budget"] = budget;
@@ -253,6 +241,12 @@ Json bandwidth(const Options &options)
     if(!depth)
         throw std::runtime_error("no subscription could be opened: " + refused);
 
+    // A record is the frame's index and timestamp, then its fields padded to 8 bytes.
+    const auto &stream = subscription->description();
+    const std::size_t record_stride =
+        16 + ((std::size_t(stream.field_bytes) + 7) & ~std::size_t(7));
+    const bool from_file = stream.field_bytes == sizeof(bench::FileFields);
+
     bench::pin(options.cpus[3]);
     proxy.command_inout("Start");
     std::uint64_t seen = 0, measured_from = 0, mismatched = 0;
@@ -273,13 +267,12 @@ Json bandwidth(const Options &options)
         if(options.rate)
         {
             const auto read_at = bench::now_ns();
-            // This array benchmark has no user fields: each record is index, timestamp.
             const auto *records = static_cast<const std::byte *>(batch->records());
             for(std::size_t i = 0; i < batch->frames(); ++i)
                 if(clock_start)
                 {
                     std::uint64_t published_at;
-                    std::memcpy(&published_at, records + i * 16 + 8, 8);
+                    std::memcpy(&published_at, records + i * record_stride + 8, 8);
                     if(published_at > std::uint64_t(read_at))
                         throw std::runtime_error(
                             "paced latency requires both roles on the same host");
@@ -300,6 +293,9 @@ Json bandwidth(const Options &options)
                         {static_cast<const std::byte *>(view.payload(i)), view.payload_bytes(i)},
                         indices[i]);
         } // GPU release records an event after the consumer's last queued operation.
+        else if(options.verify && from_file)
+            mismatched +=
+                mismatched_files(*batch, record_stride, source.at("frames").get<std::uint64_t>());
         else if(options.verify)
             for(std::size_t i = 0; i < count; ++i)
                 mismatched += !memory.matches(batch->payload(i), batch->index(i));
@@ -355,6 +351,8 @@ Json bandwidth(const Options &options)
         {"budget", {{"publisher", publisher_budget}, {"subscription", subscription_budget}}},
         {"delivery", "every"},
         {"memory", gpu ? "cuda to cuda" : "host to host"},
+        {"source", source},
+        {"read_ahead", read_ahead},
         {"cuda", gpu},
         {"thread_cpus", options.cpus},
         {"reader_cpu", sched_getcpu()},
@@ -382,6 +380,14 @@ void print_table(const Json &r)
     std::printf("tango_ucx_perftest -t bw   every, %s   lanes: %s%s\n",
                 r["memory"].get<std::string>().c_str(), r["lanes"].get<std::string>().c_str(),
                 r["verified"].get<bool>() ? "   verified" : "");
+    if(const auto &source = r["source"]; source.value("kind", "") == "hdf5")
+        std::printf("source: %s:%s  %s %s  %llu frames in the file, %s%s\n",
+                    source["file"].get<std::string>().c_str(),
+                    source["dataset"].get<std::string>().c_str(),
+                    source["element"].get<std::string>().c_str(), source["shape"].dump().c_str(),
+                    static_cast<unsigned long long>(source["frames"].get<std::uint64_t>()),
+                    source["layout"].get<std::string>().c_str(),
+                    source["filters"].empty() ? "" : (" " + source["filters"].dump()).c_str());
     std::printf("%12s %10s %7s %7s %14s %12s %10s\n", "#bytes", "#frames", "depth", "batch",
                 "frames/s", "MiB/s", "Gb/s");
     std::printf("%12llu %10llu %7u %7u %14.1f %12.1f %10.2f\n",
@@ -413,6 +419,10 @@ Options parse(int argc, char **argv)
                                    {"rate", required_argument, nullptr, 5},
                                    {"memory", required_argument, nullptr, 6},
                                    {"thread-cpus", required_argument, nullptr, 7},
+                                   {"hdf5", required_argument, nullptr, 8},
+                                   {"hdf5-dataset", required_argument, nullptr, 9},
+                                   {"describe", no_argument, nullptr, 10},
+                                   {"read-ahead", required_argument, nullptr, 11},
                                    {nullptr, 0, nullptr, 0}};
     for(int c; (c = getopt_long(argc, argv, "t:s:n:w:d:b:", longs, nullptr)) != -1;)
         switch(c)
@@ -422,6 +432,7 @@ Options parse(int argc, char **argv)
                 break;
             case 's':
                 options.frame_bytes = bytes_of(optarg);
+                options.size_given = true;
                 break;
             case 'n':
                 options.frames = std::stoull(optarg);
@@ -470,6 +481,18 @@ Options parse(int argc, char **argv)
                     throw std::invalid_argument("thread-cpus needs exactly four CPU IDs");
                 break;
             }
+            case 8:
+                options.hdf5_file = optarg;
+                break;
+            case 9:
+                options.hdf5_dataset = optarg;
+                break;
+            case 10:
+                options.describe = true;
+                break;
+            case 11:
+                options.read_ahead = std::uint32_t(std::stoul(optarg));
+                break;
             default:
                 throw std::invalid_argument("unknown option");
         }
@@ -486,6 +509,12 @@ Options parse(int argc, char **argv)
         throw std::invalid_argument("a batch is no larger than the ring is deep");
     if(options.rate > 1'000'000'000)
         throw std::invalid_argument("rate is at most one billion frames/s");
+    if(options.hdf5_file.empty() && (options.describe || !options.hdf5_dataset.empty()))
+        throw std::invalid_argument("--describe and --hdf5-dataset need --hdf5");
+    if(!options.hdf5_file.empty() && options.size_given)
+        throw std::invalid_argument("an HDF5 frame is the dataset's size: -s does not apply");
+    if(!options.hdf5_file.empty() && options.memory == "cuda")
+        throw std::invalid_argument("HDF5 frames are read into host memory");
     return options;
 }
 } // namespace
@@ -514,6 +543,11 @@ int main(int argc, char **argv)
     }
     try
     {
+        if(options.describe)
+        {
+            std::puts(describe(options).dump(options.json ? -1 : 2).c_str());
+            return 0;
+        }
         auto result = bandwidth(options);
         if(options.json)
             std::puts(result.dump().c_str());

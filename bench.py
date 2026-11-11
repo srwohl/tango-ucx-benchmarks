@@ -5,6 +5,9 @@
 
 With --reference, or a --tier, ucx_perftest runs at each size too. A point whose rings do not
 fit this host's memory is left out, and said to be.
+
+With --hdf5 the frames of an image stack are published, read from the file before each publish,
+beside generated frames of the same size: the difference is what reading the file costs.
 """
 import argparse
 import json
@@ -59,12 +62,13 @@ def available_bytes():
     return None
 
 
-def left_out(frame_bytes, depth, args):
+def left_out(frame_bytes, depth, args, read_ahead=0):
     """Why a point is not run, or nothing. Both roles' memory is this host's."""
     if frame_bytes > 2 << 30:
         return "a frame is at most 2 GiB"
-    # A publisher has at least three slots; ucx_perftest has a buffer on each side.
-    need = frame_bytes * (2 if depth is None else max(depth, 3) + depth)
+    # A publisher has at least three slots, and one more for each frame read ahead; ucx_perftest
+    # has a buffer on each side.
+    need = frame_bytes * (2 if depth is None else max(depth, 3) + read_ahead + depth)
     free = available_bytes()
     if free is not None and need > free * args.memory_share:
         return (f"needs {need / (1 << 30):.1f} GiB, and {args.memory_share:.0%} of the "
@@ -120,17 +124,19 @@ def free_port():
 
 
 class Publisher:
-    """tango_ucx_perf_publisher as a -nodb device server, stopped when the block ends."""
+    """tango_ucx_perf_publisher as a -nodb device server, stopped when the block ends. Other
+    hosts reach it at `address`, which is this host's name or address on their network."""
 
-    def __init__(self, build, env=None):
+    def __init__(self, build, env=None, address="127.0.0.1"):
+        self.address = address
         # A port found free can be taken before the server binds it: then another is tried.
         for _ in range(5):
             self.port = free_port()
-            self.device = f"127.0.0.1:{self.port}/bench/ucx/1#dbase=no"
+            self.device = f"{address}:{self.port}/bench/ucx/1#dbase=no"
             self.log = tempfile.TemporaryFile(mode="w+")
             self.process = subprocess.Popen(
                 [str(build / "tango_ucx_perf_publisher"), "bench", "-nodb", "-dlist",
-                 "bench/ucx/1", "-ORBendPoint", f"giop:tcp:127.0.0.1:{self.port}"],
+                 "bench/ucx/1", "-ORBendPoint", f"giop:tcp:{address}:{self.port}"],
                 stdout=self.log, stderr=subprocess.STDOUT, env=env)
             if self.listening():
                 return
@@ -142,7 +148,7 @@ class Publisher:
             if self.process.poll() is not None:
                 return False
             with socket.socket() as probe:
-                if probe.connect_ex(("127.0.0.1", self.port)) == 0:
+                if probe.connect_ex((self.address, self.port)) == 0:
                     return True
             time.sleep(0.1)
         self.process.kill()
@@ -172,8 +178,32 @@ def frames_for(frame_bytes, args):
     return max(floor, min(args.max_frames, args.bytes // frame_bytes))
 
 
-def run_point(build, device, frame_bytes, depth, args):
-    command = [str(build / "tango_ucx_perftest"), device, "-t", "bw", "-s", str(frame_bytes),
+def hdf5_options(args):
+    return ["--hdf5", args.hdf5] + (["--hdf5-dataset", args.hdf5_dataset]
+                                    if args.hdf5_dataset else [])
+
+
+def describe_file(build, args):
+    """What the publisher finds in the --hdf5 file: its frame size is the sweep's one size."""
+    with Publisher(build) as publisher:
+        done = subprocess.run([str(build / "tango_ucx_perftest"), publisher.device,
+                               *hdf5_options(args), "--describe", "--json"],
+                              capture_output=True, text=True)
+    if done.returncode:
+        said = (done.stderr.strip() or done.stdout.strip()).splitlines()
+        raise SystemExit(f"bench: the publisher cannot replay {args.hdf5}: "
+                         + (said[-1] if said else "no answer"))
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+def read_ahead_of(program, args):
+    return args.read_ahead if program == HDF5 else 0
+
+
+def run_point(build, device, frame_bytes, depth, args, hdf5=False):
+    size = (hdf5_options(args) + ["--read-ahead", str(args.read_ahead)] if hdf5
+            else ["-s", str(frame_bytes)])
+    command = [str(build / "tango_ucx_perftest"), device, "-t", "bw", *size,
                "-n", str(frames_for(frame_bytes, args)), "-d", str(depth),
                "-b", str(args.batch), "--json"]
     if args.verify or args.corrupt_every:
@@ -285,10 +315,15 @@ def run_reference(name, frame_bytes, args):
                 server.wait()
 
 
+HDF5 = "tango-ucx hdf5"  # frames read from the --hdf5 file; "tango-ucx" are generated
+
+
 def rows_of(args):
-    """The rows of one frame size: the references, then tango-ucx at each depth."""
+    """The rows of one frame size: the references, then tango-ucx at each depth, then the
+    file's frames at each depth."""
     rows = [(name, None) for name in (REFERENCES if args.reference else ())]
-    return rows + [("tango-ucx", depth) for depth in args.depth]
+    rows += [("tango-ucx", depth) for depth in args.depth]
+    return rows + [(HDF5, depth) for depth in args.depth if args.hdf5]
 
 
 def local(args):
@@ -304,11 +339,19 @@ def local(args):
     if host["load"] > 1.0:
         print(f"bench: the host is busy, load {host['load']:.2f}: rates will vary from run to "
               "run", file=sys.stderr)
+    if args.hdf5:
+        source = host["source"] = describe_file(build, args)
+        args.sizes = [source["frame_bytes"]]
+        filters = f", filters {', '.join(map(str, source['filters']))}" if source["filters"] else ""
+        rate = f", acquired at {source['nominal_rate']:g} frames/s" if source["nominal_rate"] else ""
+        print(f"# {source['file']}:{source['dataset']}  {source['element']} "
+              f"{'x'.join(map(str, source['shape']))}, {source['frames']} frames, "
+              f"{source['layout']}{filters}{rate}")
     if args.dry_run:
         points = runs = 0
         for frame_bytes in args.sizes:
             for program, depth in rows_of(args):
-                why = left_out(frame_bytes, depth, args)
+                why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
                 print(f"{frame_bytes:>10}  {program:<16} {'' if depth is None else depth:>5} "
                       f"{frames_for(frame_bytes, args):>8} frames  "
                       + (f"left out: {why}" if why else f"{args.runs} runs"))
@@ -331,7 +374,7 @@ def local(args):
         for frame_bytes in args.sizes:
             raw = None
             for program, depth in rows_of(args):
-                why = left_out(frame_bytes, depth, args)
+                why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
                 if why:
                     print(f"{frame_bytes:>10}  {program:<16} "
                           f"{'' if depth is None else depth:>5} left out: {why}")
@@ -347,7 +390,8 @@ def local(args):
                     if depth is None:
                         point = run_reference(program, frame_bytes, args)
                     else:
-                        point = run_point(build, publisher.device, frame_bytes, depth, args)
+                        point = run_point(build, publisher.device, frame_bytes, depth, args,
+                                          hdf5=program == HDF5)
                         point["program"] = program
                     point["depth_asked"] = depth
                     point["run"] = run
@@ -407,6 +451,13 @@ def main():
     one.add_argument("--corrupt-every", type=int, default=0,
                      help="damage every nth frame; the run passes when exactly those are found")
     one.add_argument("--dry-run", action="store_true", help="list the points and run none")
+    one.add_argument("--hdf5", help="also publish this image stack's frames, beside generated "
+                                    "ones of its frame size")
+    one.add_argument("--hdf5-dataset", help="the dataset, when the file has no NeXus "
+                                            "default/signal chain")
+    one.add_argument("--read-ahead", type=int, default=8,
+                     help="with --hdf5: frames read before they are published, in source slots "
+                          "beyond the depth; 0 reads each as it is sent (8)")
     one.add_argument("--build", default=os.environ.get("BENCH_BUILD", ROOT / "build"))
     one.add_argument("--out", help="append each point's JSON line to this file")
     one.set_defaults(run=local)
@@ -421,6 +472,16 @@ def main():
         parser.error('--rate must be between zero and one billion frames/s')
     if args.rate and args.reference:
         parser.error('--rate cannot be compared with the unpaced ucx_perftest reference')
+    if args.read_ahead < 0:
+        parser.error("--read-ahead is zero or more frames")
+    if args.hdf5_dataset and not args.hdf5:
+        parser.error("--hdf5-dataset needs --hdf5")
+    if args.hdf5:
+        if any(a.startswith("--sizes") for a in sys.argv[1:]):
+            parser.error("with --hdf5 the frame size is the dataset's: --sizes does not apply")
+        if not Path(args.hdf5).is_file():
+            parser.error(f"no file {args.hdf5}")
+        args.hdf5 = str(Path(args.hdf5).resolve())
     started = time.monotonic()
     status = args.run(args)
     print(f"# {time.monotonic() - started:.1f} s", file=sys.stderr)

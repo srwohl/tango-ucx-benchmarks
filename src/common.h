@@ -78,6 +78,34 @@ inline bool matches(std::span<const std::byte> payload, std::uint64_t frame_inde
     return !differ && std::memcmp(at, &last, payload.size() % 8) == 0;
 }
 
+// A frame whose bytes come from a file has no pattern to check, so it carries a checksum: FNV-1a
+// over 64-bit words, then the tail. Each step is a bijection, so a change in any one word or tail
+// byte changes the result.
+inline std::uint64_t checksum(std::span<const std::byte> payload)
+{
+    constexpr std::uint64_t prime = 0x100000001b3ull;
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    auto *at = payload.data();
+    std::size_t words = payload.size() / 8;
+    for(std::size_t i = 0; i < words; ++i, at += 8)
+    {
+        std::uint64_t word;
+        std::memcpy(&word, at, 8);
+        hash = (hash ^ word) * prime;
+    }
+    for(std::size_t i = 0; i < payload.size() % 8; ++i)
+        hash = (hash ^ std::uint64_t(at[i])) * prime;
+    return hash;
+}
+
+// The application fields of a frame read from a file: which frame of the dataset it is, and its
+// checksum when the run is verified (zero otherwise).
+struct FileFields
+{
+    std::uint64_t source_frame = 0, checksum = 0;
+};
+inline constexpr const char *k_file_fields_dtype = "[('source_frame', '<u8'), ('checksum', '<u8')]";
+
 // The time each thread of this process has spent on a CPU, by thread name. The library names its
 // loops, so a loop's time is told from the role's own.
 inline std::map<std::string, std::uint64_t> thread_cpu_ns()

@@ -15,6 +15,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-fno-omit-frame-pointer)
 option(BENCHMARKS_CUDA "Build CUDA source and receive benchmark rings" OFF)
+option(BENCHMARKS_HDF5 "Let the publisher read its frames from an HDF5 image stack" ON)
 
 find_package(tango-ucx CONFIG REQUIRED)
 find_package(nlohmann_json 3.12 CONFIG REQUIRED)
@@ -31,6 +32,11 @@ endif()
 
 add_executable(tango_ucx_perf_publisher src/publisher.cpp)
 target_link_libraries(tango_ucx_perf_publisher PRIVATE tango-ucx::ucx nlohmann_json::nlohmann_json)
+if(BENCHMARKS_HDF5)
+    find_package(HDF5 REQUIRED COMPONENTS C)
+    target_compile_definitions(tango_ucx_perf_publisher PRIVATE BENCHMARKS_HDF5)
+    target_link_libraries(tango_ucx_perf_publisher PRIVATE HDF5::HDF5)
+endif()
 add_executable(tango_ucx_perftest src/perftest.cpp)
 target_link_libraries(tango_ucx_perftest PRIVATE tango-ucx::ucx nlohmann_json::nlohmann_json)
 target_compile_definitions(tango_ucx_perftest PRIVATE
@@ -105,6 +111,14 @@ if(BUILD_TESTING)
         TIMEOUT 120 FAIL_REGULAR_EXPRESSION "FAILED")
     set_tests_properties(report PROPERTIES FIXTURES_REQUIRED swept
         PASS_REGULAR_EXPRESSION "after against before.*\n.*\n.* tango-ucx .* \\+0% ")
+    if(BENCHMARKS_HDF5)
+        # Frames read from NeXus files of each kind the reader handles, every one checked
+        # against the checksum read with it; then frames damaged after the checksum, found.
+        set(hdf5 ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/hdf5_sample.py
+            --build ${CMAKE_CURRENT_BINARY_DIR} --self-test)
+        add_test(NAME hdf5_replay COMMAND ${hdf5})
+        set_tests_properties(hdf5_replay PROPERTIES TIMEOUT 180)
+    endif()
     set_tests_properties(bw_reference PROPERTIES
         PASS_REGULAR_EXPRESSION "ucx_perftest -e .*\n.* tango-ucx .*%")
 endif()

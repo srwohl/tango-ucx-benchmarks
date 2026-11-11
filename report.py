@@ -7,6 +7,8 @@
     report.py results/a.jsonl results/b.jsonl      and b against a, point by point
     report.py a.jsonl b.jsonl --label before,after --out compared.md
 
+A sweep made with bench.py --hdf5 also has its file's frames against generated ones.
+
 The first file is what the others are compared with.
 """
 import argparse
@@ -16,6 +18,7 @@ import statistics
 import sys
 
 RAW = "ucx_perftest -e"  # UCX as tango-ucx asks: what "of raw" is a share of
+HDF5 = "tango-ucx hdf5"  # frames read from an image stack before each publish
 NOISY = 0.15  # a point whose best and worst differ by more of its median is marked
 
 
@@ -200,6 +203,55 @@ def trouble_section(labels, sweeps):
     return lines + ([""] if found else ["None.", ""])
 
 
+def hdf5_section(label, meta, points):
+    """Frames read from a file against generated frames of the same size, and what of the
+    publisher's time went to reading."""
+    source = meta.get("source")
+    keys = sorted(key for key in points if key[0] == HDF5)
+    if not keys or not source:
+        return []
+    filters = ", ".join(map(str, source.get("filters") or [])) or "none"
+    nominal = source.get("nominal_rate")
+    lines = [f"## Frames from a file: {label}", "",
+             f"`{source['file']}`, dataset `{source['dataset']}`: {source['element']} "
+             f"{' x '.join(map(str, source['shape']))}, {frame(source['frame_bytes'])} a frame, "
+             f"{source['frames']} frames, {source['layout']}, filters {filters}"
+             + (f", acquired at {nominal:,.6g} frames/s" if nominal else "") + ".", "",
+             "Each frame is read into its source slot before it is published; the file is read "
+             "again from its first frame when a run needs more. With read-ahead a reader thread "
+             "does that, up to that many frames before they are sent, in source slots beyond "
+             "the depth; with none the publishing thread reads each frame itself. \"Reading\" "
+             "is the share of the publisher's run spent in `H5Dread`, and \"waiting\" the share "
+             "the publishing thread spent waiting for the reader: near 100% reading and high "
+             "waiting say the file, not the transport, sets the rate. Both are from all the "
+             "runs of a point. A file that fits in the page cache is read from memory after its "
+             "first pass.", ""]
+    header = ["Frame", "Depth", "Read-ahead", "generated", "from the file", "of generated",
+              "of raw", "reading", "waiting", "frames/s"] + (["of acquisition"] if nominal else [])
+    rows = []
+    for _, size, depth in keys:
+        mine = points[(HDF5, size, depth)]
+        generated = median_of(points, "tango-ucx", size, depth)
+        raw = median_of(points, RAW, size)
+        publishers = [run.get("publisher", {}) for run in mine["runs"]]
+        reading = sum(p.get("seconds_reading", 0) for p in publishers)
+        waiting = sum(p.get("seconds_waiting_for_a_read", 0) for p in publishers)
+        looping = sum(p.get("seconds", 0) for p in publishers)
+        ahead = sorted({run.get("read_ahead", 0) for run in mine["runs"]})
+        median = mine.get("median")
+        row = [frame(size), depth, ", ".join(map(str, ahead)), rate(generated), rate(median),
+               f"{100 * median / generated:.0f}%" if median and generated else "",
+               f"{100 * median / raw:.0f}%" if median and raw else "",
+               f"{100 * reading / looping:.0f}%" if looping else "",
+               f"{100 * waiting / looping:.0f}%" if looping else "",
+               rate(mine.get("frames_per_second"))]
+        if nominal:
+            fps = mine.get("frames_per_second")
+            row.append(f"{100 * fps / nominal:.0f}%" if fps else "")
+        rows.append(row)
+    return lines + table(header, rows)
+
+
 def path_section(label, points):
     sizes = sorted({size for _, size, _ in points})
     rows = []
@@ -233,6 +285,8 @@ def main():
         lines += compared_section(labels, sweeps)
     for label, (_, points) in zip(labels, sweeps):
         lines += share_section(label, points)
+    for label, (meta, points) in zip(labels, sweeps):
+        lines += hdf5_section(label, meta, points)
     for label, (_, points) in zip(labels, sweeps):
         lines += small_frame_section(label, points)
     lines += trouble_section(labels, sweeps)

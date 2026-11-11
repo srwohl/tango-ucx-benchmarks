@@ -19,6 +19,8 @@ ucx = ">=1.21"
 nlohmann_json = ">=3.12"
 # The driver.
 python = ">=3.11"
+hdf5 = ">=2.2.0,<3"
+h5py = ">=3.16.0,<4"
 
 [feature.gpu.dependencies]
 # ucx_perftest's CUDA allocator is a plugin linked to the CUDA runtime. UCX's
