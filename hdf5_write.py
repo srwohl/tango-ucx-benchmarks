@@ -36,6 +36,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from bench import Publisher, describe_host, size  # noqa: E402
+import remote  # noqa: E402
 
 
 def layouts(text):
@@ -64,16 +65,18 @@ def is_local(host):
 
 
 class Process:
-    """One writer process, here or on another host by ssh, with its output read as it comes."""
+    """One writer process, here or on another host by ssh, with its output read as it comes.
+    Another host is reached through the session's login to it; slot is the command's number
+    among those that host runs at once."""
 
-    def __init__(self, host, command, log):
+    def __init__(self, host, command, log, session=None, slot=0):
         settings = [f"{name}={value}" for name, value in sorted(os.environ.items())
                     if name.startswith(("UCX_", "TANGO_UCX_")) and name != "TANGO_UCX_SOURCE"]
         if is_local(host):
             argv = command
         else:
             remote = shlex.join(["env", *settings, *command])
-            argv = ["ssh", "-o", "BatchMode=yes", host, f"cd {shlex.quote(str(ROOT))} && {remote}"]
+            argv = session.argv(host, f"cd {shlex.quote(str(ROOT))} && {remote}", slot)
         self.host, self.lines, self.log = host, queue.Queue(), log
         self.process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=log, text=True)
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -185,7 +188,7 @@ def sustained(writers, start_ns, end_ns):
             "GB_per_second_min": min(rates), "GB_per_second_max": max(rates)}
 
 
-def run_once(args, publisher, processes, threads, run_name, repeat, logs):
+def run_once(args, publisher, session, processes, threads, run_name, repeat, logs):
     hosts = args.hosts
     writers_wanted = processes * threads * len(hosts)
     record = {"test": "hdf5_write", "ok": False, "run": run_name, "repeat": repeat,
@@ -222,7 +225,7 @@ def run_once(args, publisher, processes, threads, run_name, repeat, logs):
         launched = []
         shard = 0
         for host in hosts:
-            for _ in range(processes):
+            for slot in range(processes):
                 build = args.build if is_local(host) else (args.remote_build or args.build)
                 command = [f"{build}/tango_ucx_hdf5_writer",
                            "write", publisher.device, str(prefix), "--frame-bytes", str(frame_bytes),
@@ -234,7 +237,7 @@ def run_once(args, publisher, processes, threads, run_name, repeat, logs):
                     command += ["--chunk-frames", str(args.chunk_frames)]
                 if args.no_sync:
                     command.append("--no-sync")
-                launched.append(Process(host, command, logs))
+                launched.append(Process(host, command, logs, session, slot))
                 shard += threads
         deadline = time.monotonic() + 120
         for process in launched:
@@ -347,12 +350,16 @@ def sweep(args):
     failed = 0
     print(f"{'layout':>8} {'hosts':>5} {'writers':>7} {'GB/s':>7} {'durable':>7} {'per writer':>10} "
           f"{'H5Dwrite':>8} {'waiting':>7} {'1 s min':>7} {'1 s max':>7} {'sync s':>7}  result")
-    with Publisher(args.build, address=address) as publisher:
+    # One login to each other host for the sweep, enough for its largest layout.
+    logins = {h: max(p for p, _ in args.layouts) for h in args.hosts if not is_local(h)}
+    with remote.Session.from_args(args, logins) as session, \
+            Publisher(args.build, address=address) as publisher:
         for number, (processes, threads, repeat) in enumerate(plan):
             if publisher.process.poll() is not None:
                 print("the publisher ended:\n" + publisher.said(), file=sys.stderr)
                 return 1
-            record = run_once(args, publisher, processes, threads, f"run-{number:04d}", repeat, logs)
+            record = run_once(args, publisher, session, processes, threads, f"run-{number:04d}",
+                              repeat, logs)
             if out:
                 out.write(json.dumps(record) + "\n")
                 out.flush()
@@ -441,6 +448,7 @@ def main():
     parser.add_argument("--out", help="a new file for the run records, one JSON line each")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    remote.add_arguments(parser)
     args = parser.parse_args()
     args.build = args.build.resolve()
     if args.self_test:

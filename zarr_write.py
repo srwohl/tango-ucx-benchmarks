@@ -52,6 +52,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 from bench import Publisher, describe_host, size  # noqa: E402
 from hdf5_write import Process, expected_generated, is_local, layouts, sustained  # noqa: E402
+import remote  # noqa: E402
 
 WRITER = "tango_ucx_zarr_writer"
 COMPRESSIONS = ("none", "blosc-lz4", "blosc-zstd", "zstd")
@@ -274,7 +275,7 @@ def writer_options(args, shards):
     return options
 
 
-def run_once(args, publisher, processes, threads, run_name, repeat, logs):
+def run_once(args, publisher, session, processes, threads, run_name, repeat, logs):
     hosts = args.hosts
     writers_wanted = processes * threads * len(hosts)
     record = {"test": "zarr_write", "ok": False, "run": run_name, "repeat": repeat,
@@ -322,12 +323,12 @@ def run_once(args, publisher, processes, threads, run_name, repeat, logs):
         launched = []
         part = 0
         for host in hosts:
-            for _ in range(processes):
+            for slot in range(processes):
                 build = args.build if is_local(host) else (args.remote_build or args.build)
                 command = [f"{build}/{WRITER}", "write", publisher.device, str(prefix),
                            "--frame-bytes", str(frame_bytes), "--threads", str(threads),
                            "--first-part", str(part), *writer_options(args, shards)]
-                launched.append(Process(host, command, logs))
+                launched.append(Process(host, command, logs, session, slot))
                 part += threads
         deadline = time.monotonic() + 120
         for process in launched:
@@ -443,12 +444,16 @@ def sweep(args):
     print(f"{'layout':>8} {'hosts':>5} {'writers':>7} {'shard':>6} {'GB/s':>7} {'accepted':>8} "
           f"{'per writer':>10} {'appends':>7} {'1 s min':>7} {'1 s max':>7} {'close s':>7} "
           f"{'MiB':>7}  result")
-    with Publisher(args.build, address=address) as publisher:
+    # One login to each other host for the sweep, enough for its largest layout.
+    logins = {h: max(p for p, _ in args.layouts) for h in args.hosts if not is_local(h)}
+    with remote.Session.from_args(args, logins) as session, \
+            Publisher(args.build, address=address) as publisher:
         for number, (processes, threads, repeat) in enumerate(plan):
             if publisher.process.poll() is not None:
                 print("the publisher ended:\n" + publisher.said(), file=sys.stderr)
                 return 1
-            record = run_once(args, publisher, processes, threads, f"run-{number:04d}", repeat, logs)
+            record = run_once(args, publisher, session, processes, threads, f"run-{number:04d}",
+                              repeat, logs)
             if out:
                 out.write(json.dumps(record) + "\n")
                 out.flush()
@@ -576,6 +581,7 @@ def main():
     parser.add_argument("--out", help="a new file for the run records, one JSON line each")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    remote.add_arguments(parser)
     args = parser.parse_args()
     args.build = args.build.resolve()
     if args.self_test:
