@@ -9,6 +9,8 @@
 
 A sweep made with bench.py --hdf5 also has its file's frames against generated ones. A file of
 hdf5_write.py or zarr_write.py has its writes: processes x threads, on one host or several.
+A sweep of several thread placements is reported as one sweep a placement, unpinned first, so
+"Compared" shows what placing the threads changes.
 
 The first file is what the others are compared with.
 """
@@ -21,6 +23,7 @@ import sys
 RAW = "ucx_perftest -e"  # UCX as tango-ucx asks: what "of raw" is a share of
 HDF5 = "tango-ucx hdf5"  # frames read from an image stack before each publish
 NOISY = 0.15  # a point whose best and worst differ by more of its median is marked
+PLACEMENTS = ("unpinned", "one-l3", "spread-l3")  # bench.py's, in the order reported
 
 
 def frame(count):
@@ -34,8 +37,22 @@ def rate(value):
     return "" if value is None else f"{value:,.0f}"
 
 
-def load(path):
-    """A sweep's host record and its points, each the runs of one program, size and depth."""
+def placements_in(path):
+    """The thread placements a sweep measured, in bench.py's order; a sweep from before
+    placements were measured is unpinned."""
+    found = set()
+    with open(path) as lines:
+        for line in lines:
+            record = json.loads(line)
+            if "frame_bytes" in record:
+                found.add(record.get("placement", "unpinned"))
+    ordered = [name for name in PLACEMENTS if name in found]
+    return ordered + sorted(found - set(PLACEMENTS)) or ["unpinned"]
+
+
+def load(path, placement="unpinned"):
+    """A sweep's host record and its points of one thread placement, each the runs of one
+    program, size and depth."""
     meta, points = {}, {}
     with open(path) as lines:
         for line in lines:
@@ -49,6 +66,11 @@ def load(path):
                 continue
             if record.get("test") == "zarr_write":
                 meta.setdefault("zarr_writes", []).append(record)
+                continue
+            if "frame_bytes" not in record:  # a placement this host could not have
+                meta.setdefault("left_out", {})[record.get("placement")] = record.get("skipped")
+                continue
+            if record.get("placement", "unpinned") != placement:
                 continue
             depth = record.get("depth_asked")
             if depth is None and isinstance(record.get("depth"), dict):
@@ -99,7 +121,8 @@ def host_section(labels, sweeps):
     names = [("Date", "date"), ("Host", "host"), ("CPU", "cpu"), ("CPUs", "cpus"),
              ("Kernel", "kernel"), ("Governor", "governor"), ("Load at the start", "load"),
              ("tango-ucx", "tango_ucx"), ("tango-ucx-benchmarks", "benchmarks"),
-             ("Tier", "tier"), ("Options", "options"), ("Settings", "settings")]
+             ("Tier", "tier"), ("Options", "options"), ("Settings", "settings"),
+             ("Placement", "placement")]
     for title, key in names:
         rows.append([title] + [str(meta.get(key, "not recorded")) for meta, _ in sweeps])
     lines = ["## What was measured", ""]
@@ -113,6 +136,8 @@ def host_section(labels, sweeps):
             notes.append(f"the host was busy, load {meta['load']:.2f}")
         if "dirty" in str(meta.get("tango_ucx", "")) + str(meta.get("benchmarks", "")):
             notes.append("a checkout had changes that are in no commit")
+        for name, why in meta.get("left_out", {}).items():
+            notes.append(f"placement {name} was left out: {why}")
         if notes:
             lines.append(f"- **{label}:** " + "; ".join(notes) + ".")
     return lines + [""]
@@ -403,7 +428,21 @@ def main():
     labels = args.label.split(",") if args.label else [Path(path).stem for path in args.results]
     if len(labels) != len(args.results):
         parser.error("as many labels as files")
-    sweeps = [load(path) for path in args.results]
+    sweeps, names = [], []
+    for label, path in zip(labels, args.results):
+        found = placements_in(path)
+        for number, placement in enumerate(found):
+            meta, points = load(path, placement)
+            if number:  # a file's writes and notes are its first placement's
+                meta = {k: v for k, v in meta.items() if k not in ("writes", "zarr_writes",
+                                                                  "left_out")}
+            cpus = next((run.get("cpus") for point in points.values() for run in point["runs"]
+                         if run.get("cpus")), None)
+            meta = {**meta, "placement": placement + (
+                f", CPUs {','.join(map(str, cpus))}" if cpus else "")}
+            sweeps.append((meta, points))
+            names.append(label if len(found) == 1 else f"{label}, {placement}")
+    labels = names
 
     lines = ["# tango-ucx against ucx_perftest", ""]
     lines += host_section(labels, sweeps)

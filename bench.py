@@ -8,6 +8,13 @@ fit this host's memory is left out, and said to be.
 
 With --hdf5 the frames of an image stack are published, read from the file before each publish,
 beside generated frames of the same size: the difference is what reading the file costs.
+
+With --placement each point runs with its threads placed in each of these ways, and the
+ucx_perftest references with theirs placed alike:
+    unpinned    where the scheduler puts them: what a job gets by default
+    one-l3      four cores that share one L3 cache
+    spread-l3   the publisher's two threads and the subscriber's two on different L3 caches
+On a CPU of several L3 caches, as an EPYC of several chiplets, these can differ several times.
 """
 import argparse
 import json
@@ -46,12 +53,78 @@ def sizes(text):
 
 
 # What a sweep covers when nothing else is said; an option given replaces the tier's.
+PLACEMENTS = ("unpinned", "one-l3", "spread-l3")
 TIERS = {
-    "quick": dict(sizes="4K,64K,1M,16M", depth=[32], runs=1, bytes="256M"),
-    "baseline": dict(sizes="1K,4K,16K,64K,256K,1M,4M,16M", depth=[2, 32], runs=3, bytes="2G"),
-    "standard": dict(sizes="1K..64M", depth=[2, 32], runs=3, bytes="2G"),
-    "full": dict(sizes="1K..2G", depth=[2, 8, 32, 128], runs=5, bytes="4G"),
+    "quick": dict(sizes="4K,64K,1M,16M", depth=[32], runs=1, bytes="256M",
+                  placement=list(PLACEMENTS)),
+    "baseline": dict(sizes="1K,4K,16K,64K,256K,1M,4M,16M", depth=[2, 32], runs=3, bytes="2G",
+                     placement=list(PLACEMENTS)),
+    "standard": dict(sizes="1K..64M", depth=[2, 32], runs=3, bytes="2G",
+                     placement=list(PLACEMENTS)),
+    "full": dict(sizes="1K..2G", depth=[2, 8, 32, 128], runs=5, bytes="4G",
+                 placement=list(PLACEMENTS)),
 }
+
+
+def placements(text):
+    found = [name.strip() for name in text.split(",") if name.strip()]
+    unknown = set(found) - set(PLACEMENTS)
+    if unknown or not found:
+        raise argparse.ArgumentTypeError(f"placements are {', '.join(PLACEMENTS)}")
+    return list(dict.fromkeys(found))
+
+
+def l3_caches():
+    """The allowed physical cores, one CPU of each, grouped by the L3 cache they share, in
+    CPU order. A CPU whose cache is not described is grouped by its package."""
+    groups, seen = {}, set()
+    for cpu in sorted(os.sched_getaffinity(0)):
+        base = Path(f"/sys/devices/system/cpu/cpu{cpu}")
+        try:
+            core = ((base / "topology/physical_package_id").read_text().strip(),
+                    (base / "topology/core_id").read_text().strip())
+        except OSError:
+            core = ("?", str(cpu))
+        if core in seen:
+            continue  # an SMT sibling of a core already chosen
+        seen.add(core)
+        cache = f"package {core[0]}"
+        for index in sorted(base.glob("cache/index*")):
+            try:
+                if (index / "level").read_text().strip() == "3":
+                    cache = (index / "shared_cpu_list").read_text().strip()
+                    break
+            except OSError:
+                continue
+        groups.setdefault(cache, []).append(cpu)
+    return list(groups.values())
+
+
+def placement_cpus(name, caches):
+    """The CPUs of the publisher loop, producer, subscriber loop and reader for a placement,
+    and why there are none when the host cannot have it."""
+    if name == "unpinned":
+        return None, None
+    if name == "one-l3":
+        group = next((group for group in caches if len(group) >= 4), None)
+        return (group[:4], None) if group else (None, "no L3 cache has four allowed cores")
+    # spread-l3: the caches halved between the publisher's side and the subscriber's, and the
+    # two threads of a side on two caches where the side has two.
+    half = len(caches) // 2
+    if not half:
+        return None, "one L3 cache: nothing to spread across"
+    cpus = []
+    for side in (caches[:half], caches[half:]):
+        second = (side[1][0] if len(side) > 1 else side[0][1] if len(side[0]) > 1 else None)
+        if second is None:
+            return None, "too few allowed cores for two on each side"
+        cpus += [side[0][0], second]
+    return cpus, None
+
+
+def pinned_to(cpu):
+    """A preexec_fn that keeps a child to one CPU, or None for none."""
+    return None if cpu is None else (lambda: os.sched_setaffinity(0, {cpu}))
 
 
 def available_bytes():
@@ -200,7 +273,7 @@ def read_ahead_of(program, args):
     return args.read_ahead if program == HDF5 else 0
 
 
-def run_point(build, device, frame_bytes, depth, args, hdf5=False):
+def run_point(build, device, frame_bytes, depth, args, hdf5=False, cpus=None):
     size = (hdf5_options(args) + ["--read-ahead", str(args.read_ahead)] if hdf5
             else ["-s", str(frame_bytes)])
     command = [str(build / "tango_ucx_perftest"), device, "-t", "bw", *size,
@@ -212,6 +285,8 @@ def run_point(build, device, frame_bytes, depth, args, hdf5=False):
         command += ["--corrupt-every", str(args.corrupt_every)]
     if getattr(args, 'rate', 0):
         command += ['--rate', str(args.rate)]
+    if cpus:
+        command += ['--thread-cpus', ','.join(map(str, cpus))]
     done = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     lines = done.stdout.strip().splitlines()
     if not lines or not lines[-1].startswith("{"):
@@ -273,7 +348,9 @@ def protocols(report, frame_bytes, memory_type=None):
     return "; or ".join(found)
 
 
-def run_reference(name, frame_bytes, args):
+def run_reference(name, frame_bytes, args, cpus=None):
+    # Placed as tango-ucx is: the sender on the publisher loop's CPU, the receiver on the
+    # subscriber loop's.
     flags, settings = REFERENCES[name]
     frames = frames_for(frame_bytes, args)
     port = free_port()
@@ -284,7 +361,8 @@ def run_reference(name, frame_bytes, args):
              "command": " ".join(command), "settings": settings}
     try:
         server = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
+                                  stderr=subprocess.DEVNULL,
+                                  preexec_fn=pinned_to(cpus[2] if cpus else None))
     except FileNotFoundError:
         return {**point, "failure": "ucx_perftest is not on the path"}
     try:
@@ -293,7 +371,8 @@ def run_reference(name, frame_bytes, args):
             time.sleep(0.2)
             done = subprocess.run(command[:1] + ["127.0.0.1"] + command[1:],
                                   env={**env, "UCX_PROTO_INFO": "y"}, text=True,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300,
+                                  preexec_fn=pinned_to(cpus[0] if cpus else None))
             final = [line.split() for line in done.stdout.splitlines()
                      if line.lstrip().startswith("Final:")]
             if final or server.poll() is not None:
@@ -326,6 +405,15 @@ def rows_of(args):
     return rows + [(HDF5, depth) for depth in args.depth if args.hdf5]
 
 
+def placement_line(name, cpus, unavailable):
+    if unavailable:
+        return f"# placement {name}: left out: {unavailable}"
+    if cpus is None:
+        return f"# placement {name}: threads where the scheduler puts them"
+    return (f"# placement {name}: CPUs {','.join(map(str, cpus))} for the publisher loop, "
+            "producer, subscriber loop and reader")
+
+
 def local(args):
     build = Path(args.build).resolve()
     host = describe_host(args)
@@ -347,16 +435,22 @@ def local(args):
         print(f"# {source['file']}:{source['dataset']}  {source['element']} "
               f"{'x'.join(map(str, source['shape']))}, {source['frames']} frames, "
               f"{source['layout']}{filters}{rate}")
+    host["l3_caches"] = l3_caches()
+    plan = [(name, *placement_cpus(name, host["l3_caches"])) for name in args.placement]
     if args.dry_run:
         points = runs = 0
-        for frame_bytes in args.sizes:
-            for program, depth in rows_of(args):
-                why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
-                print(f"{frame_bytes:>10}  {program:<16} {'' if depth is None else depth:>5} "
-                      f"{frames_for(frame_bytes, args):>8} frames  "
-                      + (f"left out: {why}" if why else f"{args.runs} runs"))
-                points += not why
-                runs += 0 if why else args.runs
+        for name, cpus, unavailable in plan:
+            print(placement_line(name, cpus, unavailable))
+            if unavailable:
+                continue
+            for frame_bytes in args.sizes:
+                for program, depth in rows_of(args):
+                    why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
+                    print(f"{frame_bytes:>10}  {program:<16} {'' if depth is None else depth:>5} "
+                          f"{frames_for(frame_bytes, args):>8} frames  "
+                          + (f"left out: {why}" if why else f"{args.runs} runs"))
+                    points += not why
+                    runs += 0 if why else args.runs
         print(f"# {points} points, {runs} runs")
         return 0
     out = None
@@ -371,55 +465,63 @@ def local(args):
         # ucx_perftest as tango-ucx asks.
         print(f"{'#bytes':>10}  {'program':<16} {'depth':>5} {'#frames':>8} {'frames/s':>12} "
               f"{'MiB/s':>10} {'best':>9} {'worst':>9} {'of raw':>7}  path")
-        for frame_bytes in args.sizes:
-            raw = None
-            for program, depth in rows_of(args):
-                why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
-                if why:
+        for name, cpus, unavailable in plan:
+            print(placement_line(name, cpus, unavailable))
+            if unavailable:
+                if out:
+                    out.write(json.dumps({"placement": name, "skipped": unavailable}) + "\n")
+                continue
+            for frame_bytes in args.sizes:
+                raw = None
+                for program, depth in rows_of(args):
+                    why = left_out(frame_bytes, depth, args, read_ahead_of(program, args))
+                    if why:
+                        print(f"{frame_bytes:>10}  {program:<16} "
+                              f"{'' if depth is None else depth:>5} left out: {why}")
+                        if out:
+                            out.write(json.dumps({"program": program, "frame_bytes": frame_bytes,
+                                                  "depth_asked": depth, "placement": name,
+                                                  "skipped": why}) + "\n")
+                        continue
+                    runs = []
+                    for run in range(args.runs):
+                        if publisher.process.poll() is not None:
+                            print("the publisher ended:\n" + publisher.said(), file=sys.stderr)
+                            return 1
+                        if depth is None:
+                            point = run_reference(program, frame_bytes, args, cpus)
+                        else:
+                            point = run_point(build, publisher.device, frame_bytes, depth, args,
+                                              hdf5=program == HDF5, cpus=cpus)
+                            point["program"] = program
+                        point["depth_asked"] = depth
+                        point["run"] = run
+                        point["placement"], point["cpus"] = name, cpus
+                        if out:
+                            out.write(json.dumps(point) + "\n")
+                            out.flush()
+                        runs.append(point)
+                    bad = [p for p in runs if not p.get("ok")]
+                    if bad:
+                        p = bad[0]
+                        why = (f"{p['outcome']}, {p['mismatched']} mismatched of "
+                               f"{p['mismatched_expected']} expected" if "outcome" in p
+                               else p.get("failure", ""))
+                        print(f"{frame_bytes:>10}  {program:<16} FAILED in {len(bad)} of {len(runs)} "
+                              f"runs: {why}")
+                        failed += 1
+                        continue
+                    rates = sorted(p["MiB_per_second"] for p in runs)
+                    median = statistics.median(rates)
+                    middle = min(runs, key=lambda p: abs(p["MiB_per_second"] - median))
+                    if program == "ucx_perftest -e":
+                        raw = median
+                    share = f"{100 * median / raw:.0f}%" if raw and depth is not None else ""
                     print(f"{frame_bytes:>10}  {program:<16} "
-                          f"{'' if depth is None else depth:>5} left out: {why}")
-                    if out:
-                        out.write(json.dumps({"program": program, "frame_bytes": frame_bytes,
-                                              "depth_asked": depth, "skipped": why}) + "\n")
-                    continue
-                runs = []
-                for run in range(args.runs):
-                    if publisher.process.poll() is not None:
-                        print("the publisher ended:\n" + publisher.said(), file=sys.stderr)
-                        return 1
-                    if depth is None:
-                        point = run_reference(program, frame_bytes, args)
-                    else:
-                        point = run_point(build, publisher.device, frame_bytes, depth, args,
-                                          hdf5=program == HDF5)
-                        point["program"] = program
-                    point["depth_asked"] = depth
-                    point["run"] = run
-                    if out:
-                        out.write(json.dumps(point) + "\n")
-                        out.flush()
-                    runs.append(point)
-                bad = [p for p in runs if not p.get("ok")]
-                if bad:
-                    p = bad[0]
-                    why = (f"{p['outcome']}, {p['mismatched']} mismatched of "
-                           f"{p['mismatched_expected']} expected" if "outcome" in p
-                           else p.get("failure", ""))
-                    print(f"{frame_bytes:>10}  {program:<16} FAILED in {len(bad)} of {len(runs)} "
-                          f"runs: {why}")
-                    failed += 1
-                    continue
-                rates = sorted(p["MiB_per_second"] for p in runs)
-                median = statistics.median(rates)
-                middle = min(runs, key=lambda p: abs(p["MiB_per_second"] - median))
-                if program == "ucx_perftest -e":
-                    raw = median
-                share = f"{100 * median / raw:.0f}%" if raw and depth is not None else ""
-                print(f"{frame_bytes:>10}  {program:<16} "
-                      f"{'' if depth is None else middle['depth']['subscription']:>5} "
-                      f"{middle['frames']:>8} {middle['frames_per_second']:>12.1f} "
-                      f"{median:>10.1f} {rates[-1]:>9.1f} {rates[0]:>9.1f} {share:>7}  "
-                      f"{middle['protocol'] if depth is None else middle['lanes']}")
+                          f"{'' if depth is None else middle['depth']['subscription']:>5} "
+                          f"{middle['frames']:>8} {middle['frames_per_second']:>12.1f} "
+                          f"{median:>10.1f} {rates[-1]:>9.1f} {rates[0]:>9.1f} {share:>7}  "
+                          f"{middle['protocol'] if depth is None else middle['lanes']}")
     return 1 if failed else 0
 
 
@@ -458,11 +560,15 @@ def main():
     one.add_argument("--read-ahead", type=int, default=8,
                      help="with --hdf5: frames read before they are published, in source slots "
                           "beyond the depth; 0 reads each as it is sent (8)")
+    one.add_argument("--placement", type=placements,
+                     help="thread placements, each a block of rows: " + ", ".join(PLACEMENTS)
+                          + " (unpinned; a tier runs all three)")
     one.add_argument("--build", default=os.environ.get("BENCH_BUILD", ROOT / "build"))
     one.add_argument("--out", help="append each point's JSON line to this file")
     one.set_defaults(run=local)
     args = parser.parse_args()
-    usual = dict(sizes="4K,64K,1M,8M", depth=[32], runs=3, bytes="2G", reference=False)
+    usual = dict(sizes="4K,64K,1M,8M", depth=[32], runs=3, bytes="2G", reference=False,
+                 placement=["unpinned"])
     if args.tier:
         usual = {**TIERS[args.tier], "reference": True}
     for name, value in usual.items():
